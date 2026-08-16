@@ -693,6 +693,7 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
         .workspaces
         .values()
         .map(|e| e.local_id.clone())
+        .chain(state.tabs.values().map(|e| e.local_id.clone()))
         .chain(state.panes.values().map(|e| e.local_id.clone()))
         .collect();
     let user_closed = match deps.closes.lock() {
@@ -701,13 +702,40 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
     };
     let mut ws_close_remote: Vec<String> = Vec::new();
     for (rid, entry) in state.workspaces.iter_mut() {
-        if !entry.is_tombstoned() && !local_ws_ids.contains(&entry.local_id) && remote_ws_ids.contains(rid.as_str()) {
-            entry.tombstone = Some(true);
-            if close_remote && user_closed.contains(&entry.local_id) {
-                ws_close_remote.push(rid.clone());
-            } else {
-                log.log(&format!("workspace mirror for {rid} was closed locally — tombstoning"));
-            }
+        if entry.is_tombstoned() || !remote_ws_ids.contains(rid.as_str()) {
+            continue;
+        }
+        // shared mode: the mirror of a remote workspace is a set of tabs in the
+        // shared workspace, so "closed locally" means ALL its tabs are gone.
+        let local_alive = if host.workspace.is_some() {
+            state
+                .tabs
+                .values()
+                .filter(|t| t.remote_workspace.as_deref() == Some(rid.as_str()))
+                .any(|t| local_tab_ids.contains(t.local_id.as_str()))
+        } else {
+            local_ws_ids.contains(&entry.local_id)
+        };
+        if local_alive {
+            continue;
+        }
+        entry.tombstone = Some(true);
+        let user_gone = if host.workspace.is_some() {
+            // a tab loss mid-rebuild is not intent; only treat the workspace as
+            // user-closed when every tab that vanished was a user close
+            let tabs: Vec<_> = state
+                .tabs
+                .values()
+                .filter(|t| t.remote_workspace.as_deref() == Some(rid.as_str()))
+                .collect();
+            !tabs.is_empty() && tabs.iter().all(|t| user_closed.contains(&t.local_id))
+        } else {
+            user_closed.contains(&entry.local_id)
+        };
+        if close_remote && user_gone {
+            ws_close_remote.push(rid.clone());
+        } else {
+            log.log(&format!("workspace mirror for {rid} was closed locally — tombstoning"));
         }
     }
     for rid in &ws_close_remote {
@@ -763,6 +791,12 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
         state.workspaces.keys().filter(|rid| absent_twice(rid, &remote_ws_ids)).cloned().collect();
     for rid in gone_ws {
         let entry = state.workspaces.remove(&rid).unwrap();
+        if host.workspace.is_some() {
+            // shared mode: the vanished workspace's tabs were already closed by
+            // the gone_tabs sweep below; never close the shared workspace itself
+            // — other hosts still mirror into it.
+            continue;
+        }
         if !entry.is_tombstoned() && local_ws_ids.contains(&entry.local_id) {
             log.log(&format!("remote workspace {rid} gone — closing mirror {}", entry.local_id));
             mark_self_close(deps, &entry.local_id);
@@ -796,6 +830,68 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
         .map(|s| s.to_string())
         .collect();
 
+    // 2b. single-workspace mode: ensure the shared workspace exists once.
+    //     Adopted by label so every host declaring the same `workspace` name
+    //     converges onto the same local workspace. The create is racy (two hosts
+    //     can both miss it in one pass); the loser adopts on its next pass.
+    #[derive(Deserialize)]
+    struct SharedCreated {
+        workspace: SharedWs,
+        tab: SharedTab,
+    }
+    #[derive(Deserialize)]
+    struct SharedWs {
+        workspace_id: String,
+    }
+    #[derive(Deserialize)]
+    struct SharedTab {
+        tab_id: String,
+    }
+    // the shared workspace's empty default tab, consumed by the first layout.apply
+    let mut shared_root: Option<String> = None;
+    let shared_ws: Option<String> = match host.workspace.as_deref() {
+        None => None,
+        Some(label) => {
+            if let Some(w) = local_snap.workspaces.iter().find(|w| &w.label == label) {
+                Some(w.workspace_id.clone())
+            } else if state
+                .shared_workspace
+                .as_ref()
+                .is_some_and(|id| local_snap.workspaces.iter().any(|w| &w.workspace_id == id))
+            {
+                state.shared_workspace.clone()
+            } else {
+                let cwd = mirror_pane_cwd(&deps.state_dir).display().to_string();
+                match deps
+                    .local
+                    .request_t::<SharedCreated>(
+                        "workspace.create",
+                        json!({ "label": label, "cwd": cwd, "focus": false }),
+                    )
+                    .await
+                {
+                    Ok(c) => {
+                        shared_root = Some(c.tab.tab_id);
+                        log.log(&format!(
+                            "created shared workspace {label} ({})",
+                            c.workspace.workspace_id
+                        ));
+                        Some(c.workspace.workspace_id)
+                    }
+                    Err(e) => {
+                        log.log(&format!(
+                            "shared workspace {label} create failed (adopting next pass): {e}"
+                        ));
+                        None
+                    }
+                }
+            }
+        }
+    };
+    if shared_ws.is_some() {
+        state.shared_workspace = shared_ws.clone();
+    }
+
     // skip remote workspaces that are entirely another herdr-mirror's streamer
     // panes (a machine mirroring us back), so mutual mirroring can't nest.
     let mut panes_by_ws: HashMap<&str, Vec<&PaneInfo>> = HashMap::new();
@@ -817,10 +913,23 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
         if mirror_ws_ids.contains(&rws.workspace_id) {
             continue;
         }
-        let label = format!("{}: {}", host.prefix, rws.label);
         if state.workspaces.get(&rws.workspace_id).is_some_and(|e| e.is_tombstoned()) {
             continue;
         }
+        if let Some(shared_id) = &shared_ws {
+            // shared mode: no per-remote local workspace — the remote workspace maps
+            // to a tab inside the shared workspace, created by section 4's
+            // layout.apply. The first one on the creating host also consumes the
+            // shared workspace's empty default tab.
+            state.workspaces.entry(rws.workspace_id.clone()).or_insert_with(|| WsEntry {
+                local_id: shared_id.clone(),
+                tombstone: None,
+                root_tab_local_id: shared_root.take(),
+                last_remote_label: Some(rws.label.clone()),
+            });
+            continue;
+        }
+        let label = format!("{}: {}", host.prefix, rws.label);
         let existing = state
             .workspaces
             .get(&rws.workspace_id)
@@ -997,8 +1106,15 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                 let cwd = mirror_pane_cwd(&deps.state_dir).display().to_string();
                 let root = map_node(&live_root, &cwd);
                 let target_tab = ws_entry.root_tab_local_id.clone();
+                let mut params = json!({ "root": root, "focus": false });
+                if host.workspace.is_some() {
+                    // shared mode: one tab per remote tab in the shared workspace,
+                    // host-prefixed so same-named remote workspaces don't collide.
+                    params["tab_label"] = json!(format!("{}: {}", host.prefix, rtab.label));
+                } else {
+                    params["tab_label"] = json!(rtab.label);
+                }
                 // tab_id and workspace_id are mutually exclusive on layout.apply
-                let mut params = json!({ "tab_label": rtab.label, "root": root, "focus": false });
                 match &target_tab {
                     Some(t) => params["tab_id"] = json!(t),
                     None => params["workspace_id"] = json!(ws_entry.local_id),
@@ -1024,6 +1140,7 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                     crate::state::TabEntry {
                         local_id: applied.layout.tab_id,
                         last_remote_label: Some(rtab.label.clone()),
+                        remote_workspace: host.workspace.as_ref().map(|_| rtab.workspace_id.clone()),
                     },
                 );
                 let mut local_order = Vec::new();
@@ -1147,7 +1264,15 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
             // rename is intent for the REMOTE tab, and only a remote that moved
             // since we last stamped may overwrite the local label.
             if let Some(ltab) = local_tab {
-                match resolve_label(None, &rtab.label, &ltab.label, entry.last_remote_label.as_deref()) {
+                // shared mode treats the tab label the way per-workspace mode treats a
+                // workspace label: "<prefix>: <label>" is convention, renames push the
+                // bare name, and the prefix is re-stamped when the remote wins.
+                match resolve_label(
+                    host.workspace.as_ref().map(|_| host.prefix.as_str()),
+                    &rtab.label,
+                    &ltab.label,
+                    entry.last_remote_label.as_deref(),
+                ) {
                     LabelAction::PushRemote(new_remote) => {
                         log.log(&format!(
                             "local rename of tab {tab_local} → pushing \"{new_remote}\" to remote {}",
@@ -1168,13 +1293,18 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                         }
                     }
                     LabelAction::RestampLocal => {
+                        let stamped = host
+                            .workspace
+                            .as_ref()
+                            .map(|_| format!("{}: {}", host.prefix, rtab.label))
+                            .unwrap_or_else(|| rtab.label.clone());
                         // same discipline as the push above, for the same reason
                         // in reverse: recording a label the local tab never took
                         // makes the next converge read the stale local one as a
                         // user rename and push it over the remote's
                         if deps
                             .local
-                            .request("tab.rename", json!({ "tab_id": tab_local, "label": rtab.label }))
+                            .request("tab.rename", json!({ "tab_id": tab_local, "label": stamped }))
                             .await
                             .is_ok()
                         {
@@ -1326,19 +1456,33 @@ pub async fn push_pane_status(
 pub async fn apply_remote_closes(
     local: &ApiClient,
     state_dir: &std::path::Path,
-    host_name: &str,
+    host: &crate::config::HostConfig,
     closed: &[String],
     log: &Logger,
 ) {
     if closed.is_empty() {
         return;
     }
-    let mut state = load_state(state_dir, host_name);
+    let mut state = load_state(state_dir, &host.name);
     let mut changed = false;
     for rid in closed {
         if let Some(entry) = state.workspaces.remove(rid) {
             changed = true;
-            if !entry.is_tombstoned() {
+            if host.workspace.is_some() {
+                // shared mode: close exactly this workspace's tabs inside the
+                // shared workspace; the shared workspace itself is never closed
+                // by a single remote workspace going away.
+                let doomed: Vec<String> = state
+                    .tabs
+                    .values()
+                    .filter(|t| t.remote_workspace.as_deref() == Some(rid.as_str()))
+                    .map(|t| t.local_id.clone())
+                    .collect();
+                for tab in doomed {
+                    let _ = local.request("tab.close", json!({ "tab_id": tab })).await;
+                }
+                state.tabs.retain(|_, t| t.remote_workspace.as_deref() != Some(rid.as_str()));
+            } else if !entry.is_tombstoned() {
                 log.log(&format!("remote workspace {rid} closed — closing mirror {}", entry.local_id));
                 let _ = local.request("workspace.close", json!({ "workspace_id": entry.local_id })).await;
             }
@@ -1353,8 +1497,8 @@ pub async fn apply_remote_closes(
         }
     }
     if changed {
-        if let Err(e) = save_state(state_dir, host_name, &state) {
-            log.log(&format!("[{host_name}] state save failed: {e}"));
+        if let Err(e) = save_state(state_dir, &host.name, &state) {
+            log.log(&format!("[{}] state save failed: {e}", host.name));
         }
     }
 }
@@ -1402,11 +1546,11 @@ pub async fn mark_unknown(local: &ApiClient, state_dir: &std::path::Path, host_n
 pub async fn teardown(
     local: &ApiClient,
     state_dir: &std::path::Path,
-    host_name: &str,
+    host: &crate::config::HostConfig,
     log: &Logger,
     closes: Option<&crate::closes::Closes>,
 ) -> Result<()> {
-    let state = load_state(state_dir, host_name);
+    let state = load_state(state_dir, &host.name);
     // Wipe the id map BEFORE closing the local windows. teardown (and the
     // restart / zombie-heal that call it) means "stop mirroring here" — never
     // "close the remote sessions". But close_remote_on_local_close fires when a
@@ -1415,7 +1559,21 @@ pub async fn teardown(
     // nothing to attribute these closes to, so they cannot propagate to the
     // remote. Manual close is unaffected: there the entry is still mapped when
     // the user closes it, so the intent still reaches the remote.
-    save_state(state_dir, host_name, &HostState::default())?;
+    save_state(state_dir, &host.name, &HostState::default())?;
+    if host.workspace.is_some() {
+        // shared mode: "stop mirroring this host" = close its tabs. The shared
+        // workspace itself is left up — the other hosts still mirror into it.
+        for entry in state.tabs.values() {
+            log.log(&format!("closing mirror tab {}", entry.local_id));
+            if let Some(c) = closes {
+                if let Ok(mut t) = c.lock() {
+                    t.mark_self_close(&entry.local_id);
+                }
+            }
+            let _ = local.request("tab.close", json!({ "tab_id": entry.local_id })).await;
+        }
+        return Ok(());
+    }
     for entry in state.workspaces.values() {
         log.log(&format!("closing mirror workspace {}", entry.local_id));
         // ours, not the user's: the heal re-adopts these ids, so without the mark
@@ -1528,6 +1686,7 @@ mod tests {
             always_control: true,
             max_cols: None,
             max_rows: None,
+            workspace: None,
             api_transport: crate::config::ApiTransport::Auto,
         }
     }

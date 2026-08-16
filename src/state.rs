@@ -64,6 +64,11 @@ pub struct TabEntry {
     /// what tells "remote renamed" apart from "user renamed the mirror tab"
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_remote_label: Option<String>,
+    /// remote workspace this tab mirrors. Set only in single-workspace mode so a
+    /// vanished remote workspace can close exactly its own tabs inside the shared
+    /// workspace — and never the shared workspace itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_workspace: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -74,6 +79,10 @@ pub struct HostState {
     pub tabs: BTreeMap<String, TabEntry>,
     #[serde(default)]
     pub panes: BTreeMap<String, PaneEntry>,
+    /// single-workspace mode: the local workspace id this host's mirror tabs live
+    /// in (created once, adopted by label). None in per-workspace mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_workspace: Option<String>,
     /// remote object ids (ws/tab/pane) seen in the previous converge. A mirror is
     /// only closed on snapshot-absence when the object was absent last pass too,
     /// so a remote that reconnects mid-restore doesn't mass-close mirrors.

@@ -115,6 +115,10 @@ pub struct HostConfig {
     /// of the local pane blank instead. Observe is unaffected either way.
     pub max_cols: Option<usize>,
     pub max_rows: Option<usize>,
+    /// Optional single-workspace target. When set, this host's mirror panes land
+    /// as TABS inside ONE named local workspace (shared by every host declaring
+    /// the same name) instead of one local workspace per remote workspace.
+    pub workspace: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -181,6 +185,7 @@ struct RawHost {
     always_control: Option<bool>,
     max_cols: Option<usize>,
     max_rows: Option<usize>,
+    workspace: Option<String>,
     api_transport: Option<String>,
 }
 
@@ -320,6 +325,15 @@ pub fn parse_config(text: &str) -> Result<MirrorConfig> {
             always_control: h.always_control.unwrap_or(global_always_control),
             max_cols: size_cap(h.max_cols).or(global_max_cols),
             max_rows: size_cap(h.max_rows).or(global_max_rows),
+            workspace: match h.workspace.filter(|w| !w.trim().is_empty()) {
+                Some(w) if w.contains(':') => {
+                    warnings.push(format!(
+                        "[hosts.{name}]: workspace \"{w}\" must not contain ':' — skipping host"
+                    ));
+                    continue;
+                }
+                w => w.map(|w| w.trim().to_string()),
+            },
             docker_bin: h.docker_bin.unwrap_or_else(|| "docker".into()),
             api_transport,
             kind,
@@ -667,5 +681,26 @@ mod tests {
             "{:?}",
             c.warnings
         );
+    }
+
+    #[test]
+    fn workspace_parses_and_rejects_colon() {
+        let c = parse_config("[hosts.a]\ntarget = \"a\"\nworkspace = \"fleet\"\n").unwrap();
+        assert_eq!(c.hosts[0].workspace.as_deref(), Some("fleet"));
+
+        // empty is unset, same discipline as remote_bin
+        let c = parse_config("[hosts.a]\ntarget = \"a\"\nworkspace = \"\"\n").unwrap();
+        assert_eq!(c.hosts[0].workspace, None);
+
+        // ':' would collide with the "<prefix>: <label>" tab-label convention —
+        // the host is skipped with a reason, never silently coerced
+        let c = parse_config(
+            "[hosts.good]\ntarget = \"g\"\n\
+             [hosts.bad]\ntarget = \"b\"\nworkspace = \"fleet:ops\"\n",
+        )
+        .unwrap();
+        assert_eq!(c.hosts.len(), 1);
+        assert_eq!(c.hosts[0].name, "good");
+        assert!(c.warnings[0].contains("workspace"), "{:?}", c.warnings);
     }
 }

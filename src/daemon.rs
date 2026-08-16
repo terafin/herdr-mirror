@@ -272,7 +272,7 @@ async fn run_connected(
                 if closes_at.is_some_and(|t| t <= now) {
                     closes_at = None;
                     let closed = std::mem::take(&mut pending_closes);
-                    apply_remote_closes(&ctx.local, &ctx.env_state_dir, &ctx.host.name, &closed, &ctx.log).await;
+                    apply_remote_closes(&ctx.local, &ctx.env_state_dir, &ctx.host, &closed, &ctx.log).await;
                     // reconcile + refresh subscriptions after the removals
                     converge_at.get_or_insert(now);
                 }
@@ -813,7 +813,7 @@ pub async fn cmd_teardown(env: Env) -> Result<()> {
     let config = load_config(&env.config_search)?;
     let local = ApiClient::connect(&env.local_socket).await?;
     for h in &config.hosts {
-        teardown(&local, &env.state_dir, &h.name, &log, None).await?;
+        teardown(&local, &env.state_dir, h, &log, None).await?;
     }
     log.log("teardown complete (autostart paused until next start)");
     Ok(())

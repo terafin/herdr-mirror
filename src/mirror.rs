@@ -340,6 +340,10 @@ pub struct ConvergeDeps {
     /// ambiguous (rebuild in flight, failed converge, server restart), so only a
     /// close event that wasn't our own may close the remote.
     pub closes: crate::closes::Closes,
+    /// single-workspace mode: serializes the shared-workspace create across the
+    /// concurrent per-host converge tasks. `None` (single-daemon `once` runs)
+    /// means no lock — only one converge runs at a time anyway.
+    pub shared_ws_lock: Option<std::sync::Arc<tokio::sync::Mutex<()>>>,
 }
 
 /// argv for one mirror pane: this same binary in `pane` mode. Panes without a
@@ -860,11 +864,21 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
             .workspaces
             .iter()
             .any(|rws| !state.workspaces.get(&rws.workspace_id).is_some_and(|e| e.is_tombstoned()));
+    // The create must be atomic across the concurrent per-host converge tasks:
+    // two hosts that both miss each other's in-flight create each make their own
+    // workspace, and the loser strands its mirror in a one-off workspace herdr
+    // never merges (live-reproduced). So creation takes a shared lock, re-reads
+    // the LOCAL snapshot inside it (the pre-lock snapshot is stale — the other
+    // host's create may have just landed), and only creates if the label is
+    // still absent. Non-shared mode has no lock (single task anyway).
     let shared_ws: Option<String> = match host.workspace.as_deref() {
         None => None,
         Some(label) => {
-            if let Some(w) = local_snap.workspaces.iter().find(|w| &w.label == label) {
-                Some(w.workspace_id.clone())
+            let adopt = |local_snap: &Snapshot| -> Option<String> {
+                local_snap.workspaces.iter().find(|w| &w.label == label).map(|w| w.workspace_id.clone())
+            };
+            if let Some(id) = adopt(&local_snap) {
+                Some(id)
             } else if state
                 .shared_workspace
                 .as_ref()
@@ -872,33 +886,43 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
             {
                 state.shared_workspace.clone()
             } else if has_content {
-                let cwd = mirror_pane_cwd(&deps.state_dir).display().to_string();
-                match deps
-                    .local
-                    .request_t::<SharedCreated>(
-                        "workspace.create",
-                        json!({ "label": label, "cwd": cwd, "focus": false }),
-                    )
-                    .await
-                {
-                    Ok(c) => {
-                        let default_tab = c.tab.tab_id;
-                        shared_root = Some(default_tab.clone());
-                        // tracked so the end-of-pass cleanup can close it if no
-                        // mirror tab ever consumes it (persisted even if this pass
-                        // errors before the cleanup runs)
-                        state.pending_default_tab = Some(default_tab);
-                        log.log(&format!(
-                            "created shared workspace {label} ({})",
-                            c.workspace.workspace_id
-                        ));
-                        Some(c.workspace.workspace_id)
-                    }
-                    Err(e) => {
-                        log.log(&format!(
-                            "shared workspace {label} create failed (adopting next pass): {e}"
-                        ));
-                        None
+                // serialize the create; re-check with a fresh snapshot inside
+                let _guard = match &deps.shared_ws_lock {
+                    Some(l) => Some(l.lock().await),
+                    None => None,
+                };
+                let fresh = fetch_snapshot(&deps.local).await?;
+                if let Some(id) = adopt(&fresh) {
+                    Some(id)
+                } else {
+                    let cwd = mirror_pane_cwd(&deps.state_dir).display().to_string();
+                    match deps
+                        .local
+                        .request_t::<SharedCreated>(
+                            "workspace.create",
+                            json!({ "label": label, "cwd": cwd, "focus": false }),
+                        )
+                        .await
+                    {
+                        Ok(c) => {
+                            let default_tab = c.tab.tab_id;
+                            shared_root = Some(default_tab.clone());
+                            // tracked so the end-of-pass cleanup can close it if no
+                            // mirror tab ever consumes it (persisted even if this pass
+                            // errors before the cleanup runs)
+                            state.pending_default_tab = Some(default_tab);
+                            log.log(&format!(
+                                "created shared workspace {label} ({})",
+                                c.workspace.workspace_id
+                            ));
+                            Some(c.workspace.workspace_id)
+                        }
+                        Err(e) => {
+                            log.log(&format!(
+                                "shared workspace {label} create failed (adopting next pass): {e}"
+                            ));
+                            None
+                        }
                     }
                 }
             } else {

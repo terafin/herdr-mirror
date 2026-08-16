@@ -83,6 +83,13 @@ pub struct HostState {
     /// in (created once, adopted by label). None in per-workspace mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shared_workspace: Option<String>,
+    /// single-workspace mode: the empty default tab `workspace.create` produced,
+    /// not yet consumed by a mirror layout. Cleared the moment a layout.apply
+    /// turns it into a real mirror tab; closed at the end of a pass that ends
+    /// without anyone taking it (every remote workspace tombstoned / nothing to
+    /// mirror). Persisted so a mid-pass error can't orphan it forever.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_default_tab: Option<String>,
     /// remote object ids (ws/tab/pane) seen in the previous converge. A mirror is
     /// only closed on snapshot-absence when the object was absent last pass too,
     /// so a remote that reconnects mid-restore doesn't mass-close mirrors.
@@ -200,11 +207,13 @@ mod tests {
  "panes": {
   "w9:p1": { "localId": "w1234:p1", "seq": 12, "reported": "claude" },
   "wB:p1": { "localId": "w5678:p1", "tombstone": true, "seq": 3 }
- }
+ },
+ "pending_default_tab": "t0"
 }"#;
         let state: HostState = serde_json::from_str(ts).unwrap();
         assert_eq!(state.workspaces["w9"].local_id, "w1234");
         assert_eq!(state.workspaces["w9"].root_tab_local_id.as_deref(), Some("t99"));
+        assert_eq!(state.pending_default_tab.as_deref(), Some("t0"));
         assert!(state.workspaces["wB"].is_tombstoned());
         // a tab mapped before label history existed loads with none, which the
         // resolver reads as "remote wins once"
@@ -216,8 +225,10 @@ mod tests {
         let out = serde_json::to_string(&state).unwrap();
         let reparsed: HostState = serde_json::from_str(&out).unwrap();
         assert_eq!(reparsed.panes["w9:p1"].local_id, "w1234:p1");
+        assert_eq!(reparsed.pending_default_tab.as_deref(), Some("t0"));
         assert!(out.contains("localId"));
         assert!(out.contains("rootTabLocalId"));
+        assert!(out.contains("pending_default_tab"));
         // absent options stay absent
         assert!(!out.contains("\"reported\":null"));
     }

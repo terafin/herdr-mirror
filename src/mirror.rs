@@ -1053,7 +1053,12 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                     .await
                 {
                     Ok(c) => {
-                        shared_root = Some(c.tab.tab_id);
+                        let default_tab = c.tab.tab_id;
+                        shared_root = Some(default_tab.clone());
+                        // tracked so the end-of-pass cleanup can close it if no
+                        // mirror tab ever consumes it (persisted even if this pass
+                        // errors before the cleanup runs)
+                        state.pending_default_tab = Some(default_tab);
                         log.log(&format!(
                             "created shared workspace {label} ({})",
                             c.workspace.workspace_id
@@ -1320,6 +1325,11 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                 // consume the root tab only AFTER a successful apply, so a
                 // transient failure retries against it instead of stacking a tab
                 if let Some(ws) = state.workspaces.get_mut(&rtab.workspace_id) {
+                    if ws.root_tab_local_id.is_some() {
+                        // this apply just repurposed the shared workspace's
+                        // default tab into a real mirror tab — nothing to clean
+                        state.pending_default_tab = None;
+                    }
                     ws.root_tab_local_id = None;
                 }
                 // applied with `tab_label: rtab.label`, so the two agree from birth
@@ -1538,6 +1548,19 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                 reconcile_tab_geometry(deps, state, &rtab.tab_id, tab_local, &remote_panes_in_tab)
                     .await;
             }
+        }
+    }
+
+    // shared mode: the shared workspace's empty default tab from
+    // `workspace.create` ended the pass unconsumed — every remote workspace was
+    // tombstoned, or there was nothing to mirror. Close the orphan so a "closed
+    // everything" leaves no stray empty tab behind. Never closes a tab that
+    // became a tracked mirror (pending is cleared on consume; the state.tabs
+    // guard is a belt-and-suspenders check for a stale state file).
+    if let Some(orphan) = state.pending_default_tab.take() {
+        if !state.tabs.values().any(|t| t.local_id == orphan) {
+            log.log(&format!("closing unconsumed default tab {orphan} of shared workspace"));
+            let _ = deps.local.request("tab.close", json!({ "tab_id": orphan })).await;
         }
     }
 

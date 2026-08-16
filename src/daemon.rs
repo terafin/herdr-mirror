@@ -70,6 +70,13 @@ struct HostCtx {
     log: Logger,
     close_remote_on_local_close: bool,
     closes: crate::closes::Closes,
+    /// single-workspace mode: serializes the shared-workspace create across the
+    /// concurrent per-host converge tasks so exactly one host creates the shared
+    /// workspace (by label) and the rest adopt it. Without this, N hosts that
+    /// each miss the other's in-flight create each make their own workspace and
+    /// strand a mirror in a one-off workspace (live-reproduced: 16 bots in w15
+    /// "Pantheon", thor stranded in w16).
+    shared_ws_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
 
 const BROADCAST_SUBS: &[&str] = &[
@@ -208,6 +215,7 @@ async fn run_connected(
         log: ctx.log.clone(),
         close_remote_on_local_close: ctx.close_remote_on_local_close,
         closes: ctx.closes.clone(),
+        shared_ws_lock: Some(ctx.shared_ws_lock.clone()),
     };
     // broadcast-only first: subscribing a since-dead pane id is rejected, so
     // converge must prune the map before the per-pane upgrade
@@ -593,6 +601,9 @@ pub async fn cmd_run(env: Env) -> Result<()> {
             .await;
     }
     let closes = crate::closes::new_closes();
+    // shared across every host task: one shared workspace is created once,
+    // not once per concurrently-converging host (see HostCtx::shared_ws_lock).
+    let shared_ws_lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
     let mut pokers: Vec<mpsc::Sender<()>> = Vec::new();
     let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     for h in &config.hosts {
@@ -605,6 +616,7 @@ pub async fn cmd_run(env: Env) -> Result<()> {
             log: log.clone(),
             close_remote_on_local_close: config.close_remote_on_local_close,
             closes: closes.clone(),
+            shared_ws_lock: shared_ws_lock.clone(),
         };
         tasks.push(tokio::spawn(host_task(ctx, rx)));
     }
@@ -824,6 +836,8 @@ pub async fn cmd_once(env: Env) -> Result<()> {
             // close signal — an empty tracker means this pass syncs but never
             // closes a remote object, which is the correct conservative default
             closes: crate::closes::new_closes(),
+            // one-shot runs hosts sequentially, so no cross-host lock is needed
+            shared_ws_lock: None,
         })
         .await?;
         log.log(&format!("[{}] one-shot mirror complete", h.name));

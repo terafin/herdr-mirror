@@ -849,6 +849,17 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
     }
     // the shared workspace's empty default tab, consumed by the first layout.apply
     let mut shared_root: Option<String> = None;
+    // single-workspace mode: only (re)create the container when there is
+    // something left to mirror into it. Without this, closing every mirror makes
+    // each poll create an empty shared workspace — herdr drops an empty
+    // workspace from the snapshot, so "adopt by label" can never find it and the
+    // workspace gets recreated (and its default tab closed) on every pass.
+    // "Content" = a remote workspace section 1 did not tombstone this pass.
+    let has_content = host.workspace.is_some()
+        && remote_snap
+            .workspaces
+            .iter()
+            .any(|rws| !state.workspaces.get(&rws.workspace_id).is_some_and(|e| e.is_tombstoned()));
     let shared_ws: Option<String> = match host.workspace.as_deref() {
         None => None,
         Some(label) => {
@@ -860,7 +871,7 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                 .is_some_and(|id| local_snap.workspaces.iter().any(|w| &w.workspace_id == id))
             {
                 state.shared_workspace.clone()
-            } else {
+            } else if has_content {
                 let cwd = mirror_pane_cwd(&deps.state_dir).display().to_string();
                 match deps
                     .local
@@ -890,6 +901,10 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                         None
                     }
                 }
+            } else {
+                // nothing left to mirror — leave the container gone until a
+                // restore (or a new remote workspace) brings content back
+                None
             }
         }
     };

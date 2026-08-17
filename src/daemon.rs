@@ -69,6 +69,7 @@ struct HostCtx {
     local: ApiClient,
     log: Logger,
     close_remote_on_local_close: bool,
+    viewer_labels: bool,
     closes: crate::closes::Closes,
     /// single-workspace mode: serializes the shared-workspace create across the
     /// concurrent per-host converge tasks so exactly one host creates the shared
@@ -214,6 +215,7 @@ async fn run_connected(
         state_dir: ctx.env_state_dir.clone(),
         log: ctx.log.clone(),
         close_remote_on_local_close: ctx.close_remote_on_local_close,
+        viewer_labels: ctx.viewer_labels,
         closes: ctx.closes.clone(),
         shared_ws_lock: Some(ctx.shared_ws_lock.clone()),
     };
@@ -615,6 +617,7 @@ pub async fn cmd_run(env: Env) -> Result<()> {
             local: local.clone(),
             log: log.clone(),
             close_remote_on_local_close: config.close_remote_on_local_close,
+            viewer_labels: config.viewer_labels,
             closes: closes.clone(),
             shared_ws_lock: shared_ws_lock.clone(),
         };
@@ -832,6 +835,7 @@ pub async fn cmd_once(env: Env) -> Result<()> {
             state_dir: env.state_dir.clone(),
             log: log.clone(),
             close_remote_on_local_close: config.close_remote_on_local_close,
+            viewer_labels: config.viewer_labels,
             // one-shot: no local event stream, so there is no authoritative
             // close signal — an empty tracker means this pass syncs but never
             // closes a remote object, which is the correct conservative default

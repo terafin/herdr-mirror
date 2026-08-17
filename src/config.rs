@@ -133,6 +133,14 @@ pub struct MirrorConfig {
     /// also closes the matching object on the remote. Set false to make a local
     /// close only stop mirroring, leaving the remote — and any agent — running.
     pub close_remote_on_local_close: bool,
+    /// when true (the default), mirror tabs/workspaces are treated as the
+    /// local user's own UI: labels are never force-stamped to the
+    /// "<host>: <name>" convention and a local rename is never propagated to
+    /// the remote (nor the remote label ever pushed back). The mirror becomes
+    /// a passive live viewer of the remote. Set false to restore the
+    /// bidirectional label-sync (renames push to the remote, remote renames
+    /// restamp the local tab).
+    pub viewer_labels: bool,
     pub hosts: Vec<HostConfig>,
     /// which hosts.toml this came from. `None` when parsed from a string
     /// (tests). Logged at startup so "which config won?" is never a guess.
@@ -161,6 +169,10 @@ struct RawConfig {
     poll_seconds: Option<u64>,
     default_host: Option<String>,
     close_remote_on_local_close: Option<bool>,
+    // daemon-wide switches under `[daemon]` (close_remote_on_local_close,
+    // viewer_labels). `[daemon]` wins over the top-level form when both appear;
+    // serde silently drops an undeclared table, so this must be declared.
+    daemon: Option<RawDaemon>,
     always_control: Option<bool>,
     max_cols: Option<usize>,
     max_rows: Option<usize>,
@@ -168,6 +180,12 @@ struct RawConfig {
     // is the remote-create fallback, so order is user-visible
     #[serde(default)]
     hosts: toml::Table,
+}
+
+#[derive(Deserialize)]
+struct RawDaemon {
+    close_remote_on_local_close: Option<bool>,
+    viewer_labels: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -361,7 +379,22 @@ pub fn parse_config(text: &str) -> Result<MirrorConfig> {
         poll_seconds: raw.poll_seconds.unwrap_or(60),
         autostart: raw.autostart.unwrap_or(true),
         default_host: raw.default_host,
-        close_remote_on_local_close: raw.close_remote_on_local_close.unwrap_or(true),
+        // `[daemon] close_remote_on_local_close` is the deployed contract form
+        // (see RawConfig::daemon); a top-level form is honored as a fallback.
+        close_remote_on_local_close: raw
+            .daemon
+            .as_ref()
+            .and_then(|d| d.close_remote_on_local_close)
+            .or(raw.close_remote_on_local_close)
+            .unwrap_or(true),
+        // viewer_labels defaults to true: a fleet mirror view is the user's
+        // own UI, and labels must stay theirs (no <host>: prefix, no rename
+        // propagation). Same `[daemon]`-wins resolution as the close flag.
+        viewer_labels: raw
+            .daemon
+            .as_ref()
+            .and_then(|d| d.viewer_labels)
+            .unwrap_or(true),
         hosts,
         source: None,
         shadowed: Vec::new(),
@@ -478,6 +511,88 @@ mod tests {
         let c = parse_config("[hosts.zeta]\ntarget = \"z\"\n[hosts.alpha]\ntarget = \"a\"\n").unwrap();
         assert_eq!(c.hosts[0].name, "zeta");
         assert_eq!(c.hosts[1].name, "alpha");
+    }
+
+    /// The DEPLOYED fleet contract, verbatim shape: all 17 bots, mesh names,
+    /// `remote_bin`, `workspace = "Pantheon"`, `always_control = false` per
+    /// host, and the daemon-level close safety under `[daemon]`. Parses to the
+    /// right defaults — most importantly close_remote_on_local_close = FALSE
+    /// (the parser silently ignored `[daemon]` until it was added, which made
+    /// a local mirror close tear down a remote bot's session).
+    #[test]
+    fn parses_the_17_host_fleet_contract() {
+        let roster = [
+            "heimdall", "mimir", "thor", "frigg", "ullr", "idunn", "bragi", "forseti", "volund",
+            "shadowfall", "saga", "eir", "sindri", "njord", "tyr", "brokkr", "urd",
+        ];
+        let mut text = String::from("[daemon]\nclose_remote_on_local_close = false\n");
+        for name in roster {
+            text.push_str(&format!(
+                "\n[hosts.{name}]\ntarget = \"{name}.intarweb.internal\"\n\
+                 remote_bin = \"/home/terafin/.local/bin/herdr\"\n\
+                 workspace = \"Pantheon\"\nalways_control = false\n"
+            ));
+        }
+        let c = parse_config(&text).unwrap();
+        assert_eq!(c.hosts.len(), 17);
+        assert!(!c.close_remote_on_local_close); // the contract's whole point
+        assert_eq!(c.poll_seconds, 60); // NO override — backstop stays at default
+        for (i, name) in roster.iter().enumerate() {
+            let h = &c.hosts[i];
+            assert_eq!(h.name, *name, "declaration order preserved");
+            assert_eq!(h.target, format!("{name}.intarweb.internal")); // mesh, no IPs
+            assert_eq!(h.workspace.as_deref(), Some("Pantheon"));
+            assert!(!h.always_control);
+            assert_eq!(h.remote_bin.as_deref(), Some("/home/terafin/.local/bin/herdr"));
+        }
+    }
+
+    /// `[daemon]` wins over a top-level close_remote_on_local_close when both
+    /// appear; and the daemon form alone is honored.
+    #[test]
+    fn daemon_table_overrides_top_level_close_flag() {
+        let c = parse_config(
+            "close_remote_on_local_close = true\n\
+             [daemon]\nclose_remote_on_local_close = false\n\
+             [hosts.a]\ntarget = \"a\"\n",
+        )
+        .unwrap();
+        assert!(!c.close_remote_on_local_close);
+        let c = parse_config("[daemon]\nclose_remote_on_local_close = true\n[hosts.a]\ntarget = \"a\"\n").unwrap();
+        assert!(c.close_remote_on_local_close);
+    }
+
+    /// viewer_labels defaults to TRUE (a fleet mirror view is the user's own UI
+    /// — labels stay theirs, nothing re-stamps or pushes them), and
+    /// `[daemon] viewer_labels = false` flips it to the legacy bidirectional
+    /// label-sync mode.
+    #[test]
+    fn viewer_labels_defaults_true_and_parses_false() {
+        // default: no [daemon] viewer_labels anywhere
+        let c = parse_config("[hosts.a]\ntarget = \"a\"\n").unwrap();
+        assert!(c.viewer_labels, "default must be the passive-viewer mode");
+        // explicit true survives parse
+        let c = parse_config("[daemon]\nviewer_labels = true\n[hosts.a]\ntarget = \"a\"\n").unwrap();
+        assert!(c.viewer_labels);
+        // explicit false flips to legacy label-sync
+        let c = parse_config("[daemon]\nviewer_labels = false\n[hosts.a]\ntarget = \"a\"\n").unwrap();
+        assert!(!c.viewer_labels);
+        // the full 17-host fleet contract keeps the default on (no daemon key)
+        let roster = [
+            "heimdall", "mimir", "thor", "frigg", "ullr", "idunn", "bragi", "forseti", "volund",
+            "shadowfall", "saga", "eir", "sindri", "njord", "tyr", "brokkr", "urd",
+        ];
+        let mut text = String::from("[daemon]\nclose_remote_on_local_close = false\n");
+        for name in roster {
+            text.push_str(&format!(
+                "\n[hosts.{name}]\ntarget = \"{name}.intarweb.internal\"\n\
+                 remote_bin = \"/home/terafin/.local/bin/herdr\"\n\
+                 workspace = \"Pantheon\"\nalways_control = true\n"
+            ));
+        }
+        let c = parse_config(&text).unwrap();
+        assert!(c.viewer_labels, "fleet contract must stay a passive viewer by default");
+        assert!(!c.close_remote_on_local_close);
     }
 
     /// Every pre-container hosts.toml must parse exactly as before.

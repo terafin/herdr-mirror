@@ -825,9 +825,13 @@ impl App {
     fn stop_session(&mut self) {
         if let Some(mut s) = self.session.take() {
             tokio::spawn(async move {
-                if s.mode == Mode::Control {
-                    let _ = s.stdin.write_all(b"{\"type\":\"terminal.release\"}\n").await;
-                }
+                // Always release the remote attach before killing the child,
+                // in every mode. Killing first (or only releasing in Control)
+                // leaves the bot's terminal attach lock held by the dying
+                // process → the next spawn_session's `terminal attach` fails
+                // with "already has an active attachment" and every keystroke
+                // waits on that contention (~1.3s per char, live-observed).
+                let _ = s.stdin.write_all(b"{\"type\":\"terminal.release\"}\n").await;
                 tokio::time::sleep(Duration::from_millis(150)).await;
                 unsafe { libc::kill(s.pid, libc::SIGTERM) };
             });

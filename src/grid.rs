@@ -341,6 +341,36 @@ mod tests {
         assert_eq!(&*g.rows[2][1].as_ref().unwrap().sgr, "\x1b[31m");
     }
 
+    /// Stream cleanliness: an idle window writes nothing. The renderer diffs
+    /// rows against its last paint, so painting an UNCHANGED grid emits no row
+    /// content — the seam where the old predictive-echo overlay injected
+    /// optimistic keystroke ghosts (stray characters in idle panes).
+    #[test]
+    fn unchanged_grid_repaints_no_content() {
+        let mut g = Grid::new();
+        g.resize(12, 3);
+        g.apply("\x1b[1;1H\x1b[0mhello\x1b[2;1Hworld\x1b[?25h");
+        let mut r = Renderer::default();
+        let first = r.paint(&g, 12, 3);
+        assert!(first.contains("hello"), "first paint must show the content");
+        assert!(first.contains("world"));
+
+        // idle: same grid, again and again — no row content may reappear
+        for _ in 0..3 {
+            let repaint = r.paint(&g, 12, 3);
+            assert!(
+                !repaint.contains("hello") && !repaint.contains("world"),
+                "idle repaint injected content: {repaint:?}"
+            );
+        }
+
+        // a real frame change repaints exactly the changed rows
+        g.apply("\x1b[2;1Hnew\x1b[0m");
+        let changed = r.paint(&g, 12, 3);
+        assert!(changed.contains("new"), "changed row must repaint");
+        assert!(!changed.contains("hello"), "unchanged row must not repaint");
+    }
+
     #[test]
     fn cursor_style_does_not_print_itself() {
         // DECSCUSR: ESC [ 2 SP q. The space is an intermediate byte, so a

@@ -39,6 +39,11 @@ pub struct TabInfo {
     pub workspace_id: String,
     #[serde(default)]
     pub label: String,
+    /// the tab's position in its workspace (0-based), published by the remote
+    /// snapshot; absent on older remotes. `layout` uses it to capture and
+    /// re-assert tab ordering.
+    #[serde(default)]
+    pub number: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -635,8 +640,25 @@ pub(crate) async fn spawn_streamer_pane(
 /// can't collide with a real dir.
 const MIRROR_CWD_MARKER: &str = ".mirror-pane";
 
-fn mirror_pane_cwd(state_dir: &std::path::Path) -> std::path::PathBuf {
+pub(crate) fn mirror_pane_cwd(state_dir: &std::path::Path) -> std::path::PathBuf {
     state_dir.join(MIRROR_CWD_MARKER)
+}
+
+/// The remote-close decision. Closing a remote bot's workspace/pane is
+/// destructive and is authorized ONLY by the conjunction of the config flag
+/// (`close_remote_on_local_close`, false in the fleet contract) AND an
+/// event-confirmed user close. Absence alone — a rebuild, a failed converge, a
+/// server restart — never authorizes it.
+pub fn should_close_remote(close_remote_on_local_close: bool, user_gone: bool) -> bool {
+    close_remote_on_local_close && user_gone
+}
+
+/// Shared-mode workspace user_gone: a tab loss mid-rebuild is not intent, so a
+/// workspace is only treated as user-closed when every tab of it that vanished
+/// was an event-confirmed user close — and there was at least one (an empty set
+/// is a rebuild artifact, not "the user closed all the tabs").
+pub fn all_user_closed(user_closed: &std::collections::HashSet<String>, tab_local_ids: &[String]) -> bool {
+    !tab_local_ids.is_empty() && tab_local_ids.iter().all(|t| user_closed.contains(t))
 }
 
 /// Is this remote pane another herdr-mirror's streamer pane? Read from the
@@ -693,6 +715,9 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
     //    which also happens mid-rebuild, after a failed converge, or while the
     //    local server is restarting.
     let close_remote = deps.close_remote_on_local_close;
+    // The remote close fires ONLY on the conjunction of config permission AND
+    // event-confirmed user intent — a missing mirror is never evidence on its
+    // own. Extracted so the lifecycle contract is directly testable.
     let mine: HashSet<String> = state
         .workspaces
         .values()
@@ -725,18 +750,17 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
         }
         entry.tombstone = Some(true);
         let user_gone = if host.workspace.is_some() {
-            // a tab loss mid-rebuild is not intent; only treat the workspace as
-            // user-closed when every tab that vanished was a user close
-            let tabs: Vec<_> = state
+            let tab_local_ids: Vec<String> = state
                 .tabs
                 .values()
                 .filter(|t| t.remote_workspace.as_deref() == Some(rid.as_str()))
+                .map(|t| t.local_id.clone())
                 .collect();
-            !tabs.is_empty() && tabs.iter().all(|t| user_closed.contains(&t.local_id))
+            all_user_closed(&user_closed, &tab_local_ids)
         } else {
             user_closed.contains(&entry.local_id)
         };
-        if close_remote && user_gone {
+        if should_close_remote(close_remote, user_gone) {
             ws_close_remote.push(rid.clone());
         } else {
             log.log(&format!("workspace mirror for {rid} was closed locally — tombstoning"));
@@ -761,7 +785,7 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
             match ws_entry {
                 Some(w) if !w.is_tombstoned() && local_ws_ids.contains(&w.local_id) => {
                     entry.tombstone = Some(true);
-                    if close_remote && user_closed.contains(&entry.local_id) {
+                    if should_close_remote(close_remote, user_closed.contains(&entry.local_id)) {
                         pane_close_remote.push(rid.clone());
                     } else {
                         log.log(&format!("pane mirror for {rid} was closed locally — tombstoning"));
@@ -2163,6 +2187,37 @@ mod tests {
         assert_eq!(ws_rank("work: slice", &prefixes), 1);
         assert_eq!(ws_rank("vps: ~", &prefixes), 2);
         assert_eq!(ws_rank("utopia", &prefixes), 0); // local
+    }
+
+    /// THE fleet lifecycle contract: close_remote_on_local_close = false (the
+    /// deployed [daemon] setting) means a user-closed local mirror NEVER closes
+    /// the remote, however clear the intent. Closing a local tab must leave the
+    /// remote bot's herdr session running.
+    #[test]
+    fn contract_close_remote_false_never_closes_the_remote() {
+        let user_gone = true; // event-confirmed, unambiguous user close
+        assert!(!should_close_remote(false, user_gone));
+        assert!(should_close_remote(true, user_gone));
+        // absence alone is never intent, even when the flag is on
+        assert!(!should_close_remote(true, false));
+    }
+
+    /// Shared-mode workspace user_gone: only ALL of a workspace's remaining
+    /// tabs being user closes counts. A single-tab workspace whose tab was
+    /// user-closed IS fully closed (the fleet's common case: one bot workspace
+    /// = one tab). A multi-tab workspace closed only in part — or a workspace
+    /// momentarily showing no tabs (rebuild/restart) — is NOT.
+    #[test]
+    fn shared_workspace_close_requires_all_tabs_user_closed() {
+        use std::collections::HashSet;
+        let closed = HashSet::from(["t1".to_string(), "t2".to_string()]);
+        // single-tab workspace, its tab user-closed → fully closed
+        assert!(all_user_closed(&closed, &["t1".into()]));
+        assert!(all_user_closed(&closed, &["t1".into(), "t2".into()]));
+        // partial close: t3 was not user-closed → not a user-closed workspace
+        assert!(!all_user_closed(&closed, &["t1".into(), "t3".into()]));
+        // no tabs at all is a rebuild artifact, not intent
+        assert!(!all_user_closed(&closed, &[]));
     }
 
     /// An agent-exit event carries no agent + "unknown" status → has_agent()

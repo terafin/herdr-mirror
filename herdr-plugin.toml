@@ -71,6 +71,20 @@ title = "Mirror: teardown"
 description = "Stop the daemon and close all mirror workspaces"
 command = ["./target/release/herdr-mirror", "teardown"]
 
-[[events]]
-on = "workspace.focused"
-command = ["./target/release/herdr-mirror", "ensure"]
+[[actions]]
+id = "layout-save"
+title = "Mirror: save workspace layout"
+description = "Capture the shared workspace layout (tabs, order, leaf→host map) to layout.toml"
+command = ["./target/release/herdr-mirror", "layout", "save"]
+
+[[actions]]
+id = "layout-apply"
+title = "Mirror: apply workspace layout"
+description = "Re-assert the saved layout.toml (label + tab order) onto the live workspace"
+command = ["./target/release/herdr-mirror", "layout", "apply"]
+
+[[actions]]
+id = "layout-status"
+title = "Mirror: layout status"
+description = "Show layout.toml state and declared-vs-live coverage"
+command = ["./target/release/herdr-mirror", "layout", "status"]

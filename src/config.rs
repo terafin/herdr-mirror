@@ -164,10 +164,21 @@ struct RawConfig {
     always_control: Option<bool>,
     max_cols: Option<usize>,
     max_rows: Option<usize>,
+    /// the deployed contract writes daemon-wide switches under `[daemon]`
+    /// (e.g. `close_remote_on_local_close = false`); serde silently DROPS an
+    /// undeclared table, so without this the flag defaulted to true and a
+    /// local mirror close tore down the remote bot's session. `[daemon]` wins
+    /// over a top-level form when both are present.
+    daemon: Option<RawDaemon>,
     // toml::Table (preserve_order) keeps declaration order — the first host
     // is the remote-create fallback, so order is user-visible
     #[serde(default)]
     hosts: toml::Table,
+}
+
+#[derive(Deserialize)]
+struct RawDaemon {
+    close_remote_on_local_close: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -361,7 +372,13 @@ pub fn parse_config(text: &str) -> Result<MirrorConfig> {
         poll_seconds: raw.poll_seconds.unwrap_or(60),
         autostart: raw.autostart.unwrap_or(true),
         default_host: raw.default_host,
-        close_remote_on_local_close: raw.close_remote_on_local_close.unwrap_or(true),
+        // `[daemon] close_remote_on_local_close` is the deployed contract form
+        // (see RawConfig::daemon); a top-level form is honored as a fallback.
+        close_remote_on_local_close: raw
+            .daemon
+            .and_then(|d| d.close_remote_on_local_close)
+            .or(raw.close_remote_on_local_close)
+            .unwrap_or(true),
         hosts,
         source: None,
         shadowed: Vec::new(),
@@ -478,6 +495,55 @@ mod tests {
         let c = parse_config("[hosts.zeta]\ntarget = \"z\"\n[hosts.alpha]\ntarget = \"a\"\n").unwrap();
         assert_eq!(c.hosts[0].name, "zeta");
         assert_eq!(c.hosts[1].name, "alpha");
+    }
+
+    /// The DEPLOYED fleet contract, verbatim shape: all 17 bots, mesh names,
+    /// `remote_bin`, `workspace = "Pantheon"`, `always_control = false` per
+    /// host, and the daemon-level close safety under `[daemon]`. Parses to the
+    /// right defaults — most importantly close_remote_on_local_close = FALSE
+    /// (the parser silently ignored `[daemon]` until it was added, which made
+    /// a local mirror close tear down a remote bot's session).
+    #[test]
+    fn parses_the_17_host_fleet_contract() {
+        let roster = [
+            "heimdall", "mimir", "thor", "frigg", "ullr", "idunn", "bragi", "forseti", "volund",
+            "shadowfall", "saga", "eir", "sindri", "njord", "tyr", "brokkr", "urd",
+        ];
+        let mut text = String::from("[daemon]\nclose_remote_on_local_close = false\n");
+        for name in roster {
+            text.push_str(&format!(
+                "\n[hosts.{name}]\ntarget = \"{name}.intarweb.internal\"\n\
+                 remote_bin = \"/home/terafin/.local/bin/herdr\"\n\
+                 workspace = \"Pantheon\"\nalways_control = false\n"
+            ));
+        }
+        let c = parse_config(&text).unwrap();
+        assert_eq!(c.hosts.len(), 17);
+        assert!(!c.close_remote_on_local_close); // the contract's whole point
+        assert_eq!(c.poll_seconds, 60); // NO override — backstop stays at default
+        for (i, name) in roster.iter().enumerate() {
+            let h = &c.hosts[i];
+            assert_eq!(h.name, *name, "declaration order preserved");
+            assert_eq!(h.target, format!("{name}.intarweb.internal")); // mesh, no IPs
+            assert_eq!(h.workspace.as_deref(), Some("Pantheon"));
+            assert!(!h.always_control);
+            assert_eq!(h.remote_bin.as_deref(), Some("/home/terafin/.local/bin/herdr"));
+        }
+    }
+
+    /// `[daemon]` wins over a top-level close_remote_on_local_close when both
+    /// appear; and the daemon form alone is honored.
+    #[test]
+    fn daemon_table_overrides_top_level_close_flag() {
+        let c = parse_config(
+            "close_remote_on_local_close = true\n\
+             [daemon]\nclose_remote_on_local_close = false\n\
+             [hosts.a]\ntarget = \"a\"\n",
+        )
+        .unwrap();
+        assert!(!c.close_remote_on_local_close);
+        let c = parse_config("[daemon]\nclose_remote_on_local_close = true\n[hosts.a]\ntarget = \"a\"\n").unwrap();
+        assert!(c.close_remote_on_local_close);
     }
 
     /// Every pre-container hosts.toml must parse exactly as before.

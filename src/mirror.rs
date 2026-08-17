@@ -333,6 +333,22 @@ fn resolve_label(
     }
 }
 
+/// The label for a BRAND-NEW mirror (a wrapper workspace, or a shared-mode tab
+/// created via layout.apply). In the default (non-viewer) mode this is the
+/// conventional "<prefix>: <name>" form; in viewer_labels mode the mirror is
+/// the user's own UI, so it takes the plain remote name — a fresh mirror must
+/// never carry a "frigg: 1"-style stamp.
+fn viewer_create_label(viewer_labels: bool, prefix: Option<&str>, remote_label: &str) -> String {
+    if viewer_labels {
+        remote_label.to_string()
+    } else {
+        match prefix {
+            Some(p) => format!("{p}: {remote_label}"),
+            None => remote_label.to_string(),
+        }
+    }
+}
+
 pub struct ConvergeDeps {
     pub local: ApiClient,
     pub remote: ApiClient,
@@ -341,6 +357,10 @@ pub struct ConvergeDeps {
     pub log: Logger,
     /// mirror closing a workspace/pane locally onto the remote (see MirrorConfig)
     pub close_remote_on_local_close: bool,
+    /// viewer mode: labels are the local user's own — never re-stamped to the
+    /// "<host>: <name>" convention and never propagated to the remote (see
+    /// MirrorConfig::viewer_labels).
+    pub viewer_labels: bool,
     /// event-confirmed local closes. Absence from the local snapshot is
     /// ambiguous (rebuild in flight, failed converge, server restart), so only a
     /// close event that wasn't our own may close the remote.
@@ -997,7 +1017,11 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
             });
             continue;
         }
-        let label = format!("{}: {}", host.prefix, rws.label);
+        // In viewer mode the mirror label is the user's own, so a brand-new
+        // mirror takes the plain remote name (no "<prefix>: " stamp) — there
+        // should never be a "frigg: 1" at creation. In the default (non-viewer)
+        // mode we keep the conventional "<prefix>: <name>" form.
+        let label = viewer_create_label(deps.viewer_labels, Some(&host.prefix), &rws.label);
         let existing = state
             .workspaces
             .get(&rws.workspace_id)
@@ -1006,43 +1030,51 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
         if let Some(entry) = existing {
             let local_ws = local_snap.workspaces.iter().find(|w| w.workspace_id == entry.local_id);
             if let Some(lws) = local_ws {
-                match resolve_label(Some(&host.prefix), &rws.label, &lws.label, entry.last_remote_label.as_deref()) {
-                    LabelAction::PushRemote(new_remote) => {
-                        // the user renamed the mirror → the rename is intent for
-                        // the REMOTE workspace; push it there and restamp local
-                        // with the canonical "<prefix>: <name>" form
-                        log.log(&format!(
-                            "local rename of {} → pushing \"{new_remote}\" to remote {}",
-                            lws.label, rws.workspace_id
-                        ));
-                        deps.remote
-                            .request(
-                                "workspace.rename",
-                                json!({ "workspace_id": rws.workspace_id, "label": new_remote }),
-                            )
-                            .await?;
-                        let stamped = format!("{}: {}", host.prefix, new_remote);
-                        if lws.label != stamped {
-                            deps.local
-                                .request("workspace.rename", json!({ "workspace_id": entry.local_id, "label": stamped }))
+                if deps.viewer_labels {
+                    // viewer mode: the local label is the user's own. Accept
+                    // whatever they named it — never restamp to the
+                    // "<prefix>: <name>" convention, never push the rename to
+                    // the remote, and never touch last_remote_label (labels
+                    // are fully decoupled from remote state here).
+                } else {
+                    match resolve_label(Some(&host.prefix), &rws.label, &lws.label, entry.last_remote_label.as_deref()) {
+                        LabelAction::PushRemote(new_remote) => {
+                            // the user renamed the mirror → the rename is intent for
+                            // the REMOTE workspace; push it there and restamp local
+                            // with the canonical "<prefix>: <name>" form
+                            log.log(&format!(
+                                "local rename of {} → pushing \"{new_remote}\" to remote {}",
+                                lws.label, rws.workspace_id
+                            ));
+                            deps.remote
+                                .request(
+                                    "workspace.rename",
+                                    json!({ "workspace_id": rws.workspace_id, "label": new_remote }),
+                                )
                                 .await?;
+                            let stamped = format!("{}: {}", host.prefix, new_remote);
+                            if lws.label != stamped {
+                                deps.local
+                                    .request("workspace.rename", json!({ "workspace_id": entry.local_id, "label": stamped }))
+                                    .await?;
+                            }
+                            if let Some(e) = state.workspaces.get_mut(&rws.workspace_id) {
+                                e.last_remote_label = Some(new_remote);
+                            }
                         }
-                        if let Some(e) = state.workspaces.get_mut(&rws.workspace_id) {
-                            e.last_remote_label = Some(new_remote);
-                        }
-                    }
-                    LabelAction::RestampLocal => {
-                        deps.local
-                            .request("workspace.rename", json!({ "workspace_id": entry.local_id, "label": label }))
-                            .await?;
-                        if let Some(e) = state.workspaces.get_mut(&rws.workspace_id) {
-                            e.last_remote_label = Some(rws.label.clone());
-                        }
-                    }
-                    LabelAction::InSync => {
-                        if entry.last_remote_label.as_deref() != Some(rws.label.as_str()) {
+                        LabelAction::RestampLocal => {
+                            deps.local
+                                .request("workspace.rename", json!({ "workspace_id": entry.local_id, "label": label }))
+                                .await?;
                             if let Some(e) = state.workspaces.get_mut(&rws.workspace_id) {
                                 e.last_remote_label = Some(rws.label.clone());
+                            }
+                        }
+                        LabelAction::InSync => {
+                            if entry.last_remote_label.as_deref() != Some(rws.label.as_str()) {
+                                if let Some(e) = state.workspaces.get_mut(&rws.workspace_id) {
+                                    e.last_remote_label = Some(rws.label.clone());
+                                }
                             }
                         }
                     }
@@ -1175,13 +1207,16 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                 let root = map_node(&live_root, &cwd);
                 let target_tab = ws_entry.root_tab_local_id.clone();
                 let mut params = json!({ "root": root, "focus": false });
-                if host.workspace.is_some() {
-                    // shared mode: one tab per remote tab in the shared workspace,
-                    // host-prefixed so same-named remote workspaces don't collide.
-                    params["tab_label"] = json!(format!("{}: {}", host.prefix, rtab.label));
-                } else {
-                    params["tab_label"] = json!(rtab.label);
-                }
+                // shared mode: one tab per remote tab in the shared workspace,
+                // host-prefixed so same-named remote workspaces don't collide —
+                // unless viewer_labels is on, where the tab is the user's own
+                // and takes the plain remote name (no "frigg: 1" stamp at
+                // creation either). Non-shared mode always uses the bare name.
+                params["tab_label"] = json!(viewer_create_label(
+                    deps.viewer_labels,
+                    host.workspace.as_ref().map(|_| host.prefix.as_str()),
+                    &rtab.label
+                ));
                 // tab_id and workspace_id are mutually exclusive on layout.apply
                 match &target_tab {
                     Some(t) => params["tab_id"] = json!(t),
@@ -1337,63 +1372,71 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
             // rename is intent for the REMOTE tab, and only a remote that moved
             // since we last stamped may overwrite the local label.
             if let Some(ltab) = local_tab {
-                // shared mode treats the tab label the way per-workspace mode treats a
-                // workspace label: "<prefix>: <label>" is convention, renames push the
-                // bare name, and the prefix is re-stamped when the remote wins.
-                match resolve_label(
-                    host.workspace.as_ref().map(|_| host.prefix.as_str()),
-                    &rtab.label,
-                    &ltab.label,
-                    entry.last_remote_label.as_deref(),
-                ) {
-                    LabelAction::PushRemote(new_remote) => {
-                        log.log(&format!(
-                            "local rename of tab {tab_local} → pushing \"{new_remote}\" to remote {}",
-                            rtab.tab_id
-                        ));
-                        // record the new label only once the remote has it, so a
-                        // failed push is retried by the next converge instead of
-                        // being mistaken for a remote rename and stomped
-                        if deps
-                            .remote
-                            .request("tab.rename", json!({ "tab_id": rtab.tab_id, "label": new_remote }))
-                            .await
-                            .is_ok()
-                        {
-                            if let Some(e) = state.tabs.get_mut(&rtab.tab_id) {
-                                e.last_remote_label = Some(new_remote);
+                if deps.viewer_labels {
+                    // Viewer mode: the tab label is the user's own — accept it
+                    // exactly as named. Never restamp to the "<prefix>: <name>"
+                    // convention, never push a rename to the remote, and never
+                    // touch last_remote_label (labels are decoupled from remote
+                    // state here).
+                } else {
+                    // shared mode treats the tab label the way per-workspace mode treats a
+                    // workspace label: "<prefix>: <label>" is convention, renames push the
+                    // bare name, and the prefix is re-stamped when the remote wins.
+                    match resolve_label(
+                        host.workspace.as_ref().map(|_| host.prefix.as_str()),
+                        &rtab.label,
+                        &ltab.label,
+                        entry.last_remote_label.as_deref(),
+                    ) {
+                        LabelAction::PushRemote(new_remote) => {
+                            log.log(&format!(
+                                "local rename of tab {tab_local} → pushing \"{new_remote}\" to remote {}",
+                                rtab.tab_id
+                            ));
+                            // record the new label only once the remote has it, so a
+                            // failed push is retried by the next converge instead of
+                            // being mistaken for a remote rename and stomped
+                            if deps
+                                .remote
+                                .request("tab.rename", json!({ "tab_id": rtab.tab_id, "label": new_remote }))
+                                .await
+                                .is_ok()
+                            {
+                                if let Some(e) = state.tabs.get_mut(&rtab.tab_id) {
+                                    e.last_remote_label = Some(new_remote);
+                                }
+                            }
+                        }
+                        LabelAction::RestampLocal => {
+                            let stamped = host
+                                .workspace
+                                .as_ref()
+                                .map(|_| format!("{}: {}", host.prefix, rtab.label))
+                                .unwrap_or_else(|| rtab.label.clone());
+                            // same discipline as the push above, for the same reason
+                            // in reverse: recording a label the local tab never took
+                            // makes the next converge read the stale local one as a
+                            // user rename and push it over the remote's
+                            if deps
+                                .local
+                                .request("tab.rename", json!({ "tab_id": tab_local, "label": stamped }))
+                                .await
+                                .is_ok()
+                            {
+                                if let Some(e) = state.tabs.get_mut(&rtab.tab_id) {
+                                    e.last_remote_label = Some(rtab.label.clone());
+                                }
+                            }
+                        }
+                        LabelAction::InSync => {
+                            if entry.last_remote_label.as_deref() != Some(rtab.label.as_str()) {
+                                if let Some(e) = state.tabs.get_mut(&rtab.tab_id) {
+                                    e.last_remote_label = Some(rtab.label.clone());
+                                }
                             }
                         }
                     }
-                    LabelAction::RestampLocal => {
-                        let stamped = host
-                            .workspace
-                            .as_ref()
-                            .map(|_| format!("{}: {}", host.prefix, rtab.label))
-                            .unwrap_or_else(|| rtab.label.clone());
-                        // same discipline as the push above, for the same reason
-                        // in reverse: recording a label the local tab never took
-                        // makes the next converge read the stale local one as a
-                        // user rename and push it over the remote's
-                        if deps
-                            .local
-                            .request("tab.rename", json!({ "tab_id": tab_local, "label": stamped }))
-                            .await
-                            .is_ok()
-                        {
-                            if let Some(e) = state.tabs.get_mut(&rtab.tab_id) {
-                                e.last_remote_label = Some(rtab.label.clone());
-                            }
-                        }
-                    }
-                    LabelAction::InSync => {
-                        if entry.last_remote_label.as_deref() != Some(rtab.label.as_str()) {
-                            if let Some(e) = state.tabs.get_mut(&rtab.tab_id) {
-                                e.last_remote_label = Some(rtab.label.clone());
-                            }
-                        }
-                    }
-                }
+                } // end viewer_labels else
             }
 
             // Placement above only sets a ratio for a split it JUST created. A
@@ -1844,6 +1887,23 @@ mod tests {
         panes.insert("p1".into(), tombstoned("l1"));
         panes.insert("p3".into(), tombstoned("l3"));
         assert!(prune_closed(&tree, &panes).is_none());
+    }
+
+    /// A brand-new mirror's label: in the default (non-viewer) mode a fresh
+    /// workspace/tab gets the conventional "<prefix>: <name>" form; in viewer
+    /// mode it must be the PLAIN remote name so there is never a "frigg: 1"
+    /// stamp at creation (the label is the user's own UI, they name it).
+    #[test]
+    fn viewer_create_label_never_stamps_when_viewer() {
+        // viewer mode → plain remote name, regardless of prefix/shared-mode
+        assert_eq!(viewer_create_label(true, Some("sindri"), "Sindri"), "Sindri");
+        assert_eq!(viewer_create_label(true, Some("frigg"), "1"), "1");
+        assert_eq!(viewer_create_label(true, None, "pantheon"), "pantheon");
+        // non-viewer → the conventional "<prefix>: <name>" form when a prefix
+        // exists, bare name when there is none
+        assert_eq!(viewer_create_label(false, Some("sindri"), "Sindri"), "sindri: Sindri");
+        assert_eq!(viewer_create_label(false, Some("frigg"), "1"), "frigg: 1");
+        assert_eq!(viewer_create_label(false, None, "pantheon"), "pantheon");
     }
 
     /// Characterization test: the ssh pane argv is a cross-process contract.

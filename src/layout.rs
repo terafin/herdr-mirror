@@ -654,6 +654,7 @@ mod tests {
             autostart: false,
             default_host: Some("a".into()),
             close_remote_on_local_close: true,
+            viewer_labels: true,
             hosts: vec![
                 crate::config::HostConfig {
                     name: "a".into(),

@@ -226,18 +226,46 @@ host, or locally outside a mirror. When it can't fire (plugin not installed
 there, typo, unreachable host, non-mirrored pane), a toast tells you why —
 key-bound output is discarded, so the toast is the feedback channel.
 
-Or skip the hand-editing entirely:
+### Workspace layout
+
+A shared "gang" workspace (see `workspace` under [Configuration](#configuration))
+holds every host's mirror as tabs. The arrangement — which tabs exist, in which
+order, with which labels, and which host each pane mirrors — can be captured to
+a hand-editable TOML and re-asserted:
 
 ```bash
-herdr-mirror remote-actions                  # list what each host + local can invoke
-herdr-mirror bind lazygit.open prefix+alt+l  # write the block above + reload herdr
-herdr-mirror unbind lazygit.open             # remove it again (or: unbind <key>)
+herdr-mirror layout save     # capture the current shared-workspace layout → layout.toml
+herdr-mirror layout status   # show the layout file and declared-vs-live coverage
+herdr-mirror layout apply    # re-assert label + tab order onto the live workspace
 ```
 
-`bind` writes the marked block to `~/.config/herdr/config.toml`, refuses keys
-the file already binds, and reloads herdr, so the key is live immediately;
-`unbind` removes only blocks that `bind` wrote. `remote-actions` also prints a
-paste-ready binding block.
+`layout.toml` lives in the state dir next to the per-host id maps (not in
+`hosts.toml`, which stays the host contract). The daemon re-applies it shortly
+after boot, so a saved arrangement persists across restarts:
+
+```toml
+workspace = "Pantheon"
+
+[[tab]]
+name = "Heimdall"
+[[tab.panes]]
+host = "heimdall"
+
+[[tab]]
+name = "Ops"
+[[tab.panes]]
+host = "eir"
+[[tab.panes]]
+host = "sindri"
+split = "right"
+ratio = 0.5
+```
+
+`apply` restamps the workspace label and reorders tabs via herdr's native
+`tab.move`; it never creates panes or writes to a remote. Intra-tab split
+geometry stays live during converge (the mirror follows the remote's layout),
+so the file pins order, labels, and presence — split direction/ratio are
+captured for reference and future edits.
 
 ### Paste and drop files
 
@@ -276,15 +304,22 @@ shell and a TUI there's a brief lag before the mouse mode catches up.
 # poll_seconds = 60      # reconcile poll interval (events drive most syncs)
 # default_host = "work"  # host that "new remote workspace" targets when
                          # invoked outside any mirror (default: first host)
-# close_remote_on_local_close = true
-                         # default. Closing a mirror pane/workspace locally
-                         # (e.g. prefix+x) also closes it on the remote. Set
-                         # false to only stop mirroring on a local close,
-                         # leaving the remote pane and its agent running.
+# close_remote_on_local_close = false
+                         # Closing a mirror pane/workspace locally (e.g.
+                         # prefix+x) also closes it on the remote. Default
+                         # true; the fleet contract sets it false (under
+                         # [daemon], below) so a local close only stops
+                         # mirroring and never tears down a headless bot's
+                         # herdr session.
 # always_control = true  # default. Mirror panes stay in control: writable, no
                          # idle release, and sized to your local pane so the
                          # remote fills it (ideal for headless remotes). Set
                          # false for read-only mirrors that escalate on type.
+
+[daemon]
+# Daemon-wide switches; the deployed fleet shape. `[daemon]` wins over a
+# top-level form when both appear.
+# close_remote_on_local_close = false
 # max_cols / max_rows    # cap the size control asks the remote for, so a
                          # machine with its own display keeps its geometry.
                          # A ceiling only, and never applies to watch-only.
@@ -301,6 +336,10 @@ target = "work"
                                      # directly (don't drive its pane sizes)
 # enabled = true                     # false stops syncing this host without
                                      # deleting its config; mirrors stay put
+# workspace = "Pantheon"             # group this host's mirror tabs into one
+                                     # shared local workspace by that name
+                                     # (hosts sharing the name share the
+                                     # workspace; see "Workspace layout")
 # api_transport = "auto"             # how to reach the remote API socket:
                                      # "socket" = ssh -L forward, "exec" = relay
                                      # over ssh exec (needs socat or python3).

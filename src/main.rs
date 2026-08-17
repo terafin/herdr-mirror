@@ -6,22 +6,20 @@
 //   herdr-mirror start|pause|ensure|status|once|restore|teardown
 //   herdr-mirror remote-workspace|remote-tab|remote-split <right|down>
 //   herdr-mirror remote-invoke <plugin>.<action>
-//   herdr-mirror remote-actions [host]              # discovery
-//   herdr-mirror bind|unbind ...                    # keybinding setup
+//   herdr-mirror layout export|save|apply|status
 
 mod api;
-mod binding;
 mod closes;
 mod config;
 mod daemon;
 mod docker;
 mod foreground;
 mod grid;
+mod layout;
 mod layout_sync;
 mod mirror;
 mod pane;
 mod paste;
-mod predict;
 mod remote;
 mod remote_action;
 mod ssh_relay;
@@ -61,11 +59,6 @@ fn run_on(rt: &tokio::runtime::Runtime, cmd: &str, rest: &[String]) -> Result<()
         "start" => {
             let env = Env::resolve()?;
             daemon::set_paused(&env, false); // explicit start lifts a manual pause
-            // explicit start is also the sanctioned moment to repair the CLI
-            // link (the daemon and the ensure hook only ever report it broken)
-            if let Some(msg) = util::repair_cli_link() {
-                println!("{msg}");
-            }
             daemon::cmd_start(&env)
         }
         "pause" | "stop" => {
@@ -102,22 +95,9 @@ fn run_on(rt: &tokio::runtime::Runtime, cmd: &str, rest: &[String]) -> Result<()
                 .ok_or_else(|| util::err("usage: herdr-mirror remote-invoke <plugin>.<action>"))?;
             rt.block_on(remote_action::invoke_cmd(Env::resolve()?, spec))
         }
-        "remote-actions" => rt.block_on(binding::remote_actions(
-            Env::resolve()?,
-            rest.get(1).map(String::as_str),
-        )),
-        "bind" => match (rest.get(1), rest.get(2)) {
-            (Some(spec), Some(key)) => rt.block_on(binding::bind(Env::resolve()?, spec, key)),
-            _ => Err(util::err("usage: herdr-mirror bind <plugin>.<action> <key>")),
-        },
-        "unbind" => {
-            let what = rest
-                .get(1)
-                .ok_or_else(|| util::err("usage: herdr-mirror unbind <plugin>.<action> | <key>"))?;
-            rt.block_on(binding::unbind(Env::resolve()?, what))
-        }
+        "layout" => layout::cmd(&Env::resolve()?, &rest[1..]),
         other => Err(util::err(format!(
-            "unknown command: {other} (daemon|pane|start|pause|ensure|status|once|restore|teardown|remote-workspace|remote-tab|remote-split|remote-invoke|remote-actions|bind|unbind)"
+            "unknown command: {other} (daemon|pane|start|pause|ensure|status|once|restore|teardown|remote-workspace|remote-tab|remote-split|remote-invoke|layout)"
         ))),
     }
 }

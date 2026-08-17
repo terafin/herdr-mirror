@@ -15,7 +15,7 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -79,6 +79,13 @@ struct HostCtx {
     shared_ws_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
 
+// layout.updated is deliberately NOT subscribed (remote or local): the
+// mirror's own writes (set_split_ratio on geometry reconcile, workspace
+// renames, layout.apply) fire it on the side they touch, so subscribing turns
+// every mirror write into a full converge that performs another write —
+// a self-feed storm. Geometry/rename changes are instead picked up by the
+// next structural event or the poll backstop (converge's geometry reconcile
+// runs whenever a split exists).
 const BROADCAST_SUBS: &[&str] = &[
     "workspace.created",
     "workspace.renamed",
@@ -89,16 +96,28 @@ const BROADCAST_SUBS: &[&str] = &[
     "pane.created",
     "pane.closed",
     "pane.exited",
-    // a bare remote resize (no pane created/closed) has no other event to
-    // hang a converge off of; falls into the generic converge_at branch below
-    // like any subscription this daemon doesn't special-case.
-    "layout.updated",
 ];
 
 fn sub_list(pane_ids: &[String]) -> Vec<Value> {
     let mut subs: Vec<Value> = BROADCAST_SUBS.iter().map(|t| json!({ "type": t })).collect();
     subs.extend(pane_ids.iter().map(|p| json!({ "type": "pane.agent_status_changed", "pane_id": p })));
     subs
+}
+
+/// Local-side subscription set. Deliberately NO layout.updated: the mirror's
+/// own layout.apply writes fire it, and poking all hosts on every one is a
+/// self-feed storm. Local geometry edits ride the next structural event or the
+/// poll backstop instead.
+fn local_sub_list() -> Vec<Value> {
+    vec![
+        json!({ "type": "workspace.created" }),
+        json!({ "type": "workspace.closed" }),
+        json!({ "type": "pane.closed" }),
+        // renaming a mirror tab locally is intent for the remote tab, which
+        // converge resolves against the label it last stamped; without this
+        // the rename is never noticed and the next converge reverts it
+        json!({ "type": "tab.renamed" }),
+    ]
 }
 
 /// Broadcast structure events + per-pane agent-status subscriptions
@@ -447,7 +466,22 @@ async fn heal_zombie_mirrors(
     }
 }
 
-// Local events: mirror closes drive tombstoning — poke every host so the
+/// Which configured host mirrors the given LOCAL id (workspace/tab/pane)?
+///
+/// Scanning the host state files mirrors how `remote_action::resolve_context`
+/// resolves an invocation back to a host; here the direction is reversed —
+/// a LOCAL id from a local event needs its owning host's task poked, and a
+/// plain user pane (in no mirror map) needs no poke at all.
+fn resolve_owner(state_dir: &Path, hosts: &[HostConfig], local_id: &str) -> Option<usize> {
+    hosts.iter().position(|h| {
+        let state = load_state(state_dir, &h.name);
+        state.workspaces.values().any(|e| e.local_id == local_id)
+            || state.tabs.values().any(|e| e.local_id == local_id)
+            || state.panes.values().any(|e| e.local_id == local_id)
+    })
+}
+
+// Local events: mirror closes drive tombstoning — poke the owning host so the
 /// next converge records the user's intent promptly.
 async fn local_events_task(
     local: ApiClient,
@@ -459,19 +493,7 @@ async fn local_events_task(
     closes: crate::closes::Closes,
 ) {
     loop {
-        let subs = vec![
-            json!({ "type": "workspace.created" }),
-            json!({ "type": "workspace.closed" }),
-            json!({ "type": "pane.closed" }),
-            // renaming a mirror tab locally is intent for the remote tab, which
-            // converge resolves against the label it last stamped; without this
-            // the rename is never noticed and the next converge reverts it
-            json!({ "type": "tab.renamed" }),
-            // resizing a mirror pane locally is an edit the remote should
-            // follow on a host we drive; the poke below is what gets it there
-            // promptly instead of on the next unrelated event
-            json!({ "type": "layout.updated" }),
-        ];
+        let subs = local_sub_list();
         match local.subscribe(subs).await {
             Ok(mut stream) => {
                 // catch a sidebar left ungrouped from a previous run
@@ -494,10 +516,26 @@ async fn local_events_task(
                             if let Ok(mut t) = closes.lock() {
                                 t.note_close_event(lid);
                             }
+                            // Poke ONLY the host that owns this local id — a
+                            // user closing a mirror pane is intent for ONE
+                            // remote, and poking all 17 on every local event
+                            // fans every local write into N converges. A local
+                            // id in no mirror map is a plain user pane; no poke.
+                            if let Some(i) = resolve_owner(&state_dir, &hosts, lid) {
+                                let _ = pokers[i].try_send(());
+                            }
                         }
                     }
-                    for p in &pokers {
-                        let _ = p.try_send(());
+                    // A local rename of a mirror tab is intent for the remote
+                    // tab's label (converge resolves it against the last
+                    // stamped label); poke the owning host so it's pushed
+                    // promptly instead of reverting on the next unrelated pass.
+                    if e.event == "tab_renamed" {
+                        if let Some(lid) = e.data.get("tab_id").and_then(|v| v.as_str()) {
+                            if let Some(i) = resolve_owner(&state_dir, &hosts, lid) {
+                                let _ = pokers[i].try_send(());
+                            }
+                        }
                     }
                     // a workspace appeared/left — keep hosts grouped (no-op if already)
                     regroup_sidebar(&local, &prefixes, &log).await;
@@ -533,21 +571,6 @@ pub async fn cmd_run(env: Env) -> Result<()> {
     }
 
     let local = ApiClient::connect(&env.local_socket).await?;
-    // Detect-and-report only: a broken CLI link means every keybinding through
-    // it dies silently, but the repair stays behind the explicit `start`
-    // command — the daemon never rewrites the filesystem in the background.
-    if let Some(problem) = crate::util::cli_link_problem() {
-        log.log(&format!("warning: {problem} — keybindings using it can't fire; run start to repair"));
-        let _ = local
-            .request(
-                "notification.show",
-                json!({
-                    "title": "mirror: CLI link broken",
-                    "body": format!("{problem} — run Mirror: start (or herdr-mirror start) to repair"),
-                }),
-            )
-            .await;
-    }
     let closes = crate::closes::new_closes();
     // shared across every host task: one shared workspace is created once,
     // not once per concurrently-converging host (see HostCtx::shared_ws_lock).
@@ -578,6 +601,10 @@ pub async fn cmd_run(env: Env) -> Result<()> {
         log.clone(),
         closes.clone(),
     )));
+    // layout.toml restore: re-assert the saved workspace label + tab order a
+    // beat after boot (converges have mapped the mirrors by then). No-op when
+    // no layout file exists.
+    tasks.push(crate::layout::spark_apply(env.clone(), log.clone()));
 
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sigint = signal(SignalKind::interrupt())?;
@@ -695,19 +722,6 @@ pub fn cmd_status(env: &Env) -> Result<()> {
             "daemon: not running{}",
             if is_paused(env) { " (paused — resume with start)" } else { "" }
         ),
-    }
-    match crate::util::cli_link_state() {
-        crate::util::CliLink::Ok(t) => println!("cli link: ok (-> {})", t.display()),
-        crate::util::CliLink::Missing => {
-            println!("cli link: MISSING ({}) — keybindings using it can't fire; start repairs it", crate::util::cli_link_path().display())
-        }
-        crate::util::CliLink::Dangling(t) => {
-            println!("cli link: BROKEN (-> {}) — keybindings using it can't fire; start repairs it", t.display())
-        }
-        crate::util::CliLink::Other(t) => println!("cli link: -> {} (not this binary; left alone)", t.display()),
-        crate::util::CliLink::File => {
-            println!("cli link: {} is a regular file (not managed)", crate::util::cli_link_path().display())
-        }
     }
     let config = load_config(&env.config_search)?;
     if let Some(src) = &config.source {
@@ -917,5 +931,77 @@ mod tests {
     fn other_subcommands_are_not_streamers() {
         assert!(!is_streamer_argv(&argv(&["/usr/local/bin/herdr-mirror", "status"])));
         assert!(!is_streamer_argv(&argv(&["/usr/local/bin/herdr-mirror"])));
+    }
+
+    /// The mirror's own layout writes must not be able to self-feed: neither
+    /// the remote nor the local subscription set contains layout.updated.
+    #[test]
+    fn no_layout_updated_subscriptions_anywhere() {
+        let types: Vec<String> = sub_list(&[])
+            .iter()
+            .filter_map(|v| v.get("type").and_then(|t| t.as_str()))
+            .map(String::from)
+            .collect();
+        assert!(!types.iter().any(|t| t == "layout.updated"), "remote subs: {types:?}");
+        for t in ["workspace.created", "tab.created", "pane.created", "pane.exited"] {
+            assert!(types.iter().any(|x| x == t), "missing {t}");
+        }
+        // per-pane agent-status is additive on top of the broadcast set
+        let with_pane = sub_list(&["w1:p1".into()]);
+        assert!(
+            with_pane
+                .iter()
+                .any(|v| v.get("type").and_then(|t| t.as_str()) == Some("pane.agent_status_changed")
+                    && v.get("pane_id").and_then(|p| p.as_str()) == Some("w1:p1"))
+        );
+        let local_types: Vec<String> = local_sub_list()
+            .iter()
+            .filter_map(|v| v.get("type").and_then(|t| t.as_str()))
+            .map(String::from)
+            .collect();
+        assert!(!local_types.iter().any(|t| t == "layout.updated"), "local subs: {local_types:?}");
+        assert!(local_types.iter().any(|t| t == "tab.renamed"));
+    }
+
+    /// resolve_owner: a local id mapped in a host state resolves to THAT host;
+    /// an unmapped id (a plain user pane) resolves to none — so a local event
+    /// pokes exactly one host, not all of them.
+    #[test]
+    fn resolve_owner_finds_the_owning_host() {
+        let dir = std::env::temp_dir().join(format!("herdr-mirror-owner-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = HostConfig {
+            name: "a".into(),
+            target: "a".into(),
+            kind: crate::config::HostKind::Ssh,
+            docker_bin: "docker".into(),
+            prefix: "a".into(),
+            remote_bin: None,
+            session: None,
+            api_transport: crate::config::ApiTransport::Auto,
+            always_control: true,
+            max_cols: None,
+            max_rows: None,
+            workspace: None,
+        };
+        let mut sa = HostState::default();
+        sa.panes.insert("ra:p".into(), crate::state::PaneEntry {
+            local_id: "t9:p1".into(),
+            tombstone: None,
+            seq: 0,
+            reported: None,
+        });
+        sa.tabs.insert("ra:t".into(), crate::state::TabEntry {
+            local_id: "t9".into(),
+            last_remote_label: None,
+            remote_workspace: Some("ra".into()),
+        });
+        crate::state::save_state(&dir, &a.name, &sa).unwrap();
+        let hosts = [a.clone(), HostConfig { name: "b".into(), ..a }];
+        assert_eq!(resolve_owner(&dir, &hosts, "t9:p1"), Some(0));
+        assert_eq!(resolve_owner(&dir, &hosts, "t9"), Some(0)); // tabs resolve too
+        assert_eq!(resolve_owner(&dir, &hosts, "nope"), None); // plain user pane
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -77,9 +77,8 @@ echo "installed ${ASSET} v${VERSION} at ${DEST}"
 # (<hash> = first 12 hex chars of sha256(<id>), herdr's managed-path scheme;
 # the link briefly dangles until herdr's rename lands, which is fine). Run by
 # hand in a dev checkout (no .tmp-* ancestor under a plugins dir) it links
-# the checkout itself. `herdr-mirror status` reports link health, and the
-# daemon toasts if it ever goes stale, so a future herdr layout change is
-# loud, not a silent dead key.
+# the checkout itself. This install is the only writer of the link, so
+# reinstall to refresh it.
 sha256_hex() {
   if command -v sha256sum >/dev/null 2>&1; then
     sha256sum | cut -d' ' -f1

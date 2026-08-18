@@ -96,6 +96,11 @@ pub struct HostConfig {
     pub kind: HostKind,
     pub docker_bin: String,
     pub prefix: String,
+    /// The local mirror's tab/workspace label for this host — the user's OWN
+    /// name, sourced from hosts.toml. Defaults to `prefix`. In viewer mode a
+    /// fresh mirror tab is created with this label (never the remote's label),
+    /// and once created nothing but the user ever changes it.
+    pub label: String,
     /// Remote herdr binary. `None` = auto-resolve on the remote: PATH first
     /// (`command -v herdr`), then `~/.local/bin/herdr`. See `remote_herdr_expr`.
     pub remote_bin: Option<String>,
@@ -197,6 +202,7 @@ struct RawHost {
     folder: Option<String>,
     docker_bin: Option<String>,
     prefix: Option<String>,
+    label: Option<String>,
     remote_bin: Option<String>,
     session: Option<String>,
     enabled: Option<bool>,
@@ -335,8 +341,13 @@ pub fn parse_config(text: &str) -> Result<MirrorConfig> {
                 }
             },
         };
+        let prefix = h.prefix.unwrap_or_else(|| name.clone());
         hosts.push(HostConfig {
-            prefix: h.prefix.unwrap_or_else(|| name.clone()),
+            prefix: prefix.clone(),
+            // the user's own tab label — defaults to the host name; once a
+            // mirror tab is created with it, nothing renames it but the user.
+            label: h.label.filter(|s| !s.trim().is_empty()).map(|s| s.trim().to_string())
+                .unwrap_or_else(|| prefix.clone()),
             // empty string is treated as unset (auto PATH → ~/.local/bin/herdr)
             remote_bin: h.remote_bin.filter(|s| !s.is_empty()),
             session: h.session.filter(|s| !s.is_empty()),
@@ -477,6 +488,7 @@ mod tests {
         let c = parse_config(
             "autostart = false\npoll_seconds = 30\ndefault_host = \"vps\"\n\
              [hosts.vps]\ntarget = \"ssh://niko@203.0.113.7:2222\"\nprefix = \"v\"\n\
+             label = \"My VPS\"\n\
              remote_bin = \"/opt/herdr\"\n\
              session = \"work\"\n\
              [hosts.off]\ntarget = \"x\"\nenabled = false\n",
@@ -486,9 +498,23 @@ mod tests {
         assert_eq!(c.poll_seconds, 30);
         assert_eq!(c.hosts.len(), 1);
         assert_eq!(c.hosts[0].prefix, "v");
+        assert_eq!(c.hosts[0].label, "My VPS");
         assert_eq!(c.hosts[0].remote_bin.as_deref(), Some("/opt/herdr"));
         assert_eq!(c.hosts[0].session.as_deref(), Some("work"));
         assert_eq!(c.default_host().unwrap().name, "vps");
+    }
+
+    #[test]
+    fn label_defaults_to_prefix_and_trims() {
+        // no `label` → falls back to the prefix (which itself defaults to the
+        // host name). Explicit empty/whitespace label is treated as unset.
+        let c = parse_config("[hosts.work]\ntarget = \"w\"\nprefix = \"v\"\n").unwrap();
+        assert_eq!(c.hosts[0].label, "v");
+        let c = parse_config("[hosts.work]\ntarget = \"w\"\nlabel = \"   \"\n").unwrap();
+        assert_eq!(c.hosts[0].label, "work");
+        // explicit label wins, trimmed of surrounding whitespace
+        let c = parse_config("[hosts.work]\ntarget = \"w\"\nlabel = \"  My Bot  \"\n").unwrap();
+        assert_eq!(c.hosts[0].label, "My Bot");
     }
 
     #[test]

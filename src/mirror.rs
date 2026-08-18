@@ -422,17 +422,21 @@ fn resolve_label(
 }
 
 /// The label for a BRAND-NEW mirror (a wrapper workspace, or a shared-mode tab
-/// created via layout.apply). In the default (non-viewer) mode this is the
-/// conventional "<prefix>: <name>" form; in viewer_labels mode the mirror is
-/// the user's own UI, so it takes the plain remote name — a fresh mirror must
-/// never carry a "frigg: 1"-style stamp.
-fn viewer_create_label(viewer_labels: bool, prefix: Option<&str>, remote_label: &str) -> String {
+/// created via layout.apply).
+///
+/// `label` is the host's label from hosts.toml (`host.label`) — the user's OWN
+/// name for this mirror. In the default (non-viewer) mode the tab carries the
+/// conventional "<prefix>: <name>" form for collision-free multi-host labels;
+/// in viewer_labels mode the mirror is the user's own UI, so the fresh mirror
+/// takes the user's label VERBATIM — never the remote's label, never a
+/// "frigg: 1"-style stamp. Once created, nothing but the user ever changes it.
+fn viewer_create_label(viewer_labels: bool, prefix: Option<&str>, label: &str) -> String {
     if viewer_labels {
-        remote_label.to_string()
+        label.to_string()
     } else {
         match prefix {
-            Some(p) => format!("{p}: {remote_label}"),
-            None => remote_label.to_string(),
+            Some(p) => format!("{p}: {label}"),
+            None => label.to_string(),
         }
     }
 }
@@ -1178,11 +1182,12 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
             });
             continue;
         }
-        // In viewer mode the mirror label is the user's own, so a brand-new
-        // mirror takes the plain remote name (no "<prefix>: " stamp) — there
-        // should never be a "frigg: 1" at creation. In the default (non-viewer)
-        // mode we keep the conventional "<prefix>: <name>" form.
-        let label = viewer_create_label(deps.viewer_labels, Some(&host.prefix), &rws.label);
+        // In viewer mode the mirror label is the user's own — sourced from
+        // hosts.toml (`host.label`), NOT the remote's label — so a brand-new
+        // mirror takes the user's label verbatim (no "<prefix>: " stamp, never
+        // the remote's name). In the default (non-viewer) mode we keep the
+        // conventional "<prefix>: <name>" form.
+        let label = viewer_create_label(deps.viewer_labels, Some(&host.prefix), &host.label);
         let existing = state
             .workspaces
             .get(&rws.workspace_id)
@@ -1377,12 +1382,13 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                 // shared mode: one tab per remote tab in the shared workspace,
                 // host-prefixed so same-named remote workspaces don't collide —
                 // unless viewer_labels is on, where the tab is the user's own
-                // and takes the plain remote name (no "frigg: 1" stamp at
-                // creation either). Non-shared mode always uses the bare name.
+                // (host.label from hosts.toml — never the remote's label, no
+                // "frigg: 1" stamp at creation either). Non-shared mode always
+                // uses the bare user label.
                 params["tab_label"] = json!(viewer_create_label(
                     deps.viewer_labels,
                     host.workspace.as_ref().map(|_| host.prefix.as_str()),
-                    &rtab.label
+                    &host.label
                 ));
                 // tab_id and workspace_id are mutually exclusive on layout.apply
                 match &target_tab {
@@ -2036,6 +2042,7 @@ mod tests {
             kind: crate::config::HostKind::Ssh,
             docker_bin: "docker".into(),
             prefix: "vps".into(),
+            label: "vps".into(),
             remote_bin: None,
             session: None,
             always_control: true,
@@ -2121,12 +2128,15 @@ mod tests {
     /// stamp at creation (the label is the user's own UI, they name it).
     #[test]
     fn viewer_create_label_never_stamps_when_viewer() {
-        // viewer mode → plain remote name, regardless of prefix/shared-mode
+        // viewer mode → the USER'S label verbatim (host.label from hosts.toml),
+        // regardless of prefix/shared-mode — never the remote's label, never a
+        // "frigg: 1" stamp, and a user label of "1" is used as-is (the mirror
+        // copies what the user named the host, not what the remote calls it).
         assert_eq!(viewer_create_label(true, Some("sindri"), "Sindri"), "Sindri");
         assert_eq!(viewer_create_label(true, Some("frigg"), "1"), "1");
         assert_eq!(viewer_create_label(true, None, "pantheon"), "pantheon");
         // non-viewer → the conventional "<prefix>: <name>" form when a prefix
-        // exists, bare name when there is none
+        // exists, bare name when there is none (label is still the user's)
         assert_eq!(viewer_create_label(false, Some("sindri"), "Sindri"), "sindri: Sindri");
         assert_eq!(viewer_create_label(false, Some("frigg"), "1"), "frigg: 1");
         assert_eq!(viewer_create_label(false, None, "pantheon"), "pantheon");

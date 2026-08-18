@@ -981,6 +981,7 @@ mod tests {
             kind: crate::config::HostKind::Ssh,
             docker_bin: "docker".into(),
             prefix: "a".into(),
+            label: "a".into(),
             remote_bin: None,
             session: None,
             api_transport: crate::config::ApiTransport::Auto,

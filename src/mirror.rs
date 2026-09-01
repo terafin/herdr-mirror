@@ -757,6 +757,18 @@ fn mirror_pane_cwd(state_dir: &std::path::Path) -> std::path::PathBuf {
     state_dir.join(MIRROR_CWD_MARKER)
 }
 
+/// cwd for the workspace's default/placeholder pane — the one bare interactive
+/// shell the user actually lands in (streamer panes exec over their shell, so
+/// their cwd is invisible and stays the marker for the loop guard). Sitting in
+/// the internal `.mirror-pane` marker dir is confusing, so open it at $HOME
+/// instead. Falls back to the marker if $HOME is unset.
+fn placeholder_pane_cwd(state_dir: &std::path::Path) -> String {
+    match std::env::var("HOME") {
+        Ok(h) if !h.is_empty() => h,
+        _ => mirror_pane_cwd(state_dir).display().to_string(),
+    }
+}
+
 /// Is this remote pane another herdr-mirror's streamer pane? Read from the
 /// snapshot cwd marker — free, and race-free.
 fn pane_is_mirror(p: &PaneInfo) -> bool {
@@ -1075,10 +1087,12 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                 struct CreatedTab {
                     tab_id: String,
                 }
-                // same non-git marker cwd the mirror panes use, so the
-                // workspace's default pane never flashes a (misleading) sidebar
-                // git branch before layout.apply swaps in the real mirror panes
-                let cwd = mirror_pane_cwd(&deps.state_dir).display().to_string();
+                // the workspace's default pane is a bare shell the user can land
+                // in (layout.apply later swaps in the streamer panes), so open it
+                // at $HOME rather than the internal marker dir — friendlier pwd,
+                // and the transient pre-apply flash shows a real home, not a path
+                // nobody recognizes.
+                let cwd = placeholder_pane_cwd(&deps.state_dir);
                 let created: Created = deps
                     .local
                     .request_t("workspace.create", json!({ "label": label, "cwd": cwd, "focus": false }))

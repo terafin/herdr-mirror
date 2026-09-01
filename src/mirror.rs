@@ -1077,7 +1077,10 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                 if let Some(id) = adopt(&fresh) {
                     Some(id)
                 } else {
-                    let cwd = mirror_pane_cwd(&deps.state_dir).display().to_string();
+                    // the shared workspace's default pane is a bare shell too —
+                    // open it at $HOME (it's closed once mirrors land, but if it
+                    // lingers the user shouldn't be sitting in the marker dir).
+                    let cwd = placeholder_pane_cwd(&deps.state_dir);
                     match deps
                         .local
                         .request_t::<SharedCreated>(

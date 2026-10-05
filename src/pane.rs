@@ -666,9 +666,8 @@ struct App {
     /// scheduled delayed re-poll to catch a foreground change the last input just
     /// caused (e.g. quitting a TUI back to a shell); bypasses the throttle
     settle_at: Option<Instant>,
-    /// whether the local mouse grab (?1002h) is currently on. Released at a shell
-    /// so herdr does native selection/scroll; re-grabbed for a TUI so clicks can
-    /// be forwarded.
+    /// whether the local mouse grab (?1002h) is currently on. Always held once
+    /// set (see `sync_mouse_grab`); Shift+drag is the native-selection escape.
     mouse_grabbed: bool,
     /// whether the local pane is currently in application cursor mode (?1h), held
     /// to match the remote's so forwarded arrows arrive in the form it expects
@@ -746,20 +745,18 @@ impl App {
         });
     }
 
-    /// Match the local mouse grab to the classification: release it at a shell so
-    /// herdr does native selection/scroll, keep it grabbed for a TUI (or while
-    /// unknown) so clicks can be forwarded. Only writes on a change.
+    /// Hold the local mouse grab whatever the classification, so the wheel always
+    /// reaches us and becomes a semantic terminal.scroll. Releasing it at a shell
+    /// handed the wheel to herdr, and the classification is only refreshed on
+    /// input: a supervisor relaunching an agent at a pane last seen at its shell
+    /// left the grab off, and the wheel typed arrows into the agent (upstream
+    /// ab72e41, #75). Clicks at a shell are still dropped by `mouse_action`.
     fn sync_mouse_grab(&mut self) {
-        if !self.tty {
+        if !self.tty || self.mouse_grabbed {
             return;
         }
-        // grab unless we've confirmed the foreground is a shell
-        let want = self.remote_is_shell != Some(true);
-        if want == self.mouse_grabbed {
-            return;
-        }
-        self.mouse_grabbed = want;
-        write_stdout(if want { "\x1b[?1002h\x1b[?1006h" } else { "\x1b[?1002l" });
+        self.mouse_grabbed = true;
+        write_stdout("\x1b[?1002h\x1b[?1006h");
     }
 
     /// Match the local pane's cursor-key mode to the remote's, so the arrow bytes

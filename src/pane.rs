@@ -424,6 +424,24 @@ fn write_stdout(s: &str) {
     let _ = out.flush();
 }
 
+/// Write an OSC 52 clipboard sequence for herdr to take. A seam so tests can
+/// observe the copy without writing a real clipboard escape to the terminal
+/// running `cargo test`.
+#[cfg(not(test))]
+fn emit_clipboard(seq: &str) {
+    write_stdout(seq);
+}
+
+#[cfg(test)]
+thread_local! {
+    static CLIPBOARD: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+fn emit_clipboard(seq: &str) {
+    CLIPBOARD.with(|c| c.borrow_mut().push(seq.to_string()));
+}
+
 /// One SGR mouse event: ESC [ < btn ; col ; row (M|m). Returns (btn, col, row,
 /// press, total len) for a sequence starting at `bytes[at]`.
 fn parse_mouse(bytes: &[u8], at: usize) -> Option<(u32, u32, u32, bool, usize)> {
@@ -518,11 +536,12 @@ enum MouseAction {
     Scroll { up: bool },
     /// click/drag on a remote TUI: forward the raw SGR sequence
     ForwardRaw,
-    /// left press/drag/release on a remote TUI: hand it to the local selection,
-    /// which defers the press and replays it if the gesture turns out to be a
-    /// click rather than a drag (see src/select.rs)
+    /// left press/drag/release: hand it to the plugin selector, which defers
+    /// the press and (on a TUI) replays it if the gesture was a click rather
+    /// than a drag (see src/select.rs)
     Select,
-    /// click/drag at a shell (or unclassified): drop, keep mouse local
+    /// unclassified, or a non-left button at a shell: drop so SGR never
+    /// reaches a prompt that never enabled mouse reporting
     Drop,
 }
 
@@ -544,19 +563,20 @@ fn button_number(btn: u32) -> u32 {
 /// and is a better judge than this side's process-name heuristic (e.g. a TUI
 /// that doesn't consume wheel events, like an agent CLI). Non-wheel
 /// clicks/drags keep the existing foreground-based routing.
-/// The left button goes to the local selection in every remote TUI, agent or
-/// not, because a drag is the gesture with no substitute: an app's click can be
-/// replayed after the fact, a selection cannot be recovered.
+/// The left button goes to the plugin selector in every classified foreground
+/// (TUI, agent, or shell), because a drag is the gesture with no substitute:
+/// an app's click can be replayed after the fact, a selection cannot be
+/// recovered. The grab is always held, so these events actually arrive — even
+/// at a shell, where releasing it used to hand selection to herdr and starve
+/// the wheel (#75).
 ///
-/// A gesture that never leaves its cell is replayed to the app as a real click,
-/// so htop still sorts on a header click and lazygit still stages on a file
-/// click. Agent CLIs get it too: they never enabled mouse reporting, but claude
-/// and codex both discard the bytes cleanly, so withholding it only stood to
-/// swallow clicks the day one of them grows mouse support.
-///
-/// A shell is unaffected: the grab is held there (so the wheel scrolls), but the
-/// left button is dropped like every other click, so raw SGR never reaches the
-/// prompt; Shift+drag is herdr's native-selection escape.
+/// A TUI gesture that never leaves its cell is replayed to the app as a real
+/// click, so htop still sorts on a header click and lazygit still stages on a
+/// file click. Agent CLIs get it too: they never enabled mouse reporting, but
+/// claude and codex both discard the bytes cleanly, so withholding it only
+/// stood to swallow clicks the day one of them grows mouse support. A shell
+/// click is not replayed: the prompt never enabled mouse reporting, and the
+/// bytes would dump into it.
 ///
 /// The cost is an in-app *drag*: vim's mouse visual-select, a resize handle.
 fn mouse_action(fg: Option<Fg>, btn: u32, press: bool) -> MouseAction {
@@ -565,8 +585,11 @@ fn mouse_action(fg: Option<Fg>, btn: u32, press: bool) -> MouseAction {
         // modified scroll still scrolls instead of falling through as a click.
         b @ (4 | 5) if press => MouseAction::Scroll { up: b == 4 },
         6 | 7 => MouseAction::Drop,
-        0 if matches!(fg, Some(Fg::Agent) | Some(Fg::Mouse)) => MouseAction::Select,
-        // middle, right, wheel release and the extra buttons
+        0 if matches!(fg, Some(Fg::Agent) | Some(Fg::Mouse) | Some(Fg::Shell)) => {
+            MouseAction::Select
+        }
+        // middle, right, wheel release and the extra buttons — TUI/agent only.
+        // A shell never asked for these; forwarding them garbage the prompt.
         _ if matches!(fg, Some(Fg::Agent) | Some(Fg::Mouse)) => MouseAction::ForwardRaw,
         _ => MouseAction::Drop,
     }
@@ -761,7 +784,8 @@ struct App {
     /// caused (e.g. quitting a TUI back to a shell); bypasses the throttle
     settle_at: Option<Instant>,
     /// whether the local mouse grab (?1002h) is currently on. Always held once
-    /// set (see `sync_mouse_grab`); Shift+drag is the native-selection escape.
+    /// set (see `sync_mouse_grab`), so a plain left-drag reaches the plugin
+    /// selector everywhere, a shell included.
     mouse_grabbed: bool,
     /// whether the local pane is currently in application cursor mode (?1h), held
     /// to match the remote's so forwarded arrows arrive in the form it expects
@@ -876,7 +900,7 @@ impl App {
     /// handed the wheel to herdr, and the classification is only refreshed on
     /// input: a supervisor relaunching an agent at a pane last seen at its shell
     /// left the grab off, and the wheel typed arrows into the agent (upstream
-    /// ab72e41, #75). Clicks at a shell are still dropped by `mouse_action`.
+    /// ab72e41, #75). A plain click at a shell is never replayed as mouse bytes.
     fn sync_mouse_grab(&mut self) {
         if !self.tty || self.mouse_grabbed {
             return;
@@ -1305,9 +1329,8 @@ impl App {
         // just caused (e.g. `:q` quitting vim — the poll above still sees vim)
         self.settle_at = Some(Instant::now() + SETTLE_DELAY);
         // wheel becomes a semantic scroll (server decides app vs scrollback);
-        // left-button drags go to the local selection and other clicks forward
-        // to the remote pty, only when the foreground is a TUI/agent — at a
-        // shell they're dropped so they don't garbage the prompt
+        // left-button drags go to the plugin selector; other TUI clicks/drags
+        // forward to the remote pty. a shell never sees raw SGR.
         let mut rest: Vec<u8> = Vec::with_capacity(buf.len());
         let mut i = 0usize;
         let mut scrolls: Vec<serde_json::Value> = Vec::new();
@@ -1341,17 +1364,16 @@ impl App {
                                     // the same read starts the next selection.
                                     sel_changed |= self.select.clear();
                                 },
-                                // It was a click, not a drag: the app gets it,
-                                // whatever the app is. An earlier version
-                                // swallowed clicks in agent panes on the theory
-                                // that a program which never enabled mouse
-                                // reporting would render the bytes as literal
-                                // text. Measured against claude and codex, both
-                                // discard them cleanly, so the special case only
-                                // stood to swallow clicks the day an agent grows
-                                // mouse support. (A shell never gets here:
-                                // `mouse_action` drops the left button there.)
-                                Released::Click(bytes) => rest.extend_from_slice(&bytes),
+                                // It was a click, not a drag. TUI/agent get it
+                                // (claude and codex discard the bytes cleanly).
+                                // A shell does not: the prompt never enabled
+                                // mouse reporting, and the bytes would dump
+                                // into it.
+                                Released::Click(bytes) => {
+                                    if self.remote_fg != Some(Fg::Shell) {
+                                        rest.extend_from_slice(&bytes);
+                                    }
+                                }
                                 Released::Nothing => {}
                             },
                         }
@@ -1389,7 +1411,7 @@ impl App {
             match crate::select::osc52(&text) {
                 // no hint on success: herdr shows its own "copied to clipboard"
                 // toast when it takes the OSC 52, so ours would be a duplicate
-                Some(seq) => write_stdout(&seq),
+                Some(seq) => emit_clipboard(&seq),
                 // too big for herdr to accept. Worth saying, because this is the
                 // one path where nothing else reports: we never emit, so there
                 // is no clipboard write for herdr to toast about.
@@ -1736,7 +1758,7 @@ mod tests {
         // the wheel never reaches the selection path at all, which is what
         // keeps PR #54's scroll regression impossible here by construction
         assert_eq!(mouse_action(Some(Fg::Agent), 0, true), MouseAction::Select);
-        assert_eq!(mouse_action(Some(Fg::Shell), 0, true), MouseAction::Drop); // shell click
+        assert_eq!(mouse_action(Some(Fg::Shell), 0, true), MouseAction::Select); // shell drag-select
         assert_eq!(mouse_action(None, 0, true), MouseAction::Drop); // unclassified click
     }
 
@@ -1750,14 +1772,13 @@ mod tests {
             assert_eq!(mouse_action(Some(fg), 1, true), MouseAction::ForwardRaw);
             assert_eq!(mouse_action(Some(fg), 2, true), MouseAction::ForwardRaw);
         }
-        // fleet: the grab is held at a shell, so these DO arrive, and every
-        // left-button phase is dropped (no local selection, no raw SGR into the
-        // prompt). Upstream ab72e41 selects here instead; the fleet keeps
-        // Shift+drag native selection. Unknown fails safe.
-        assert_eq!(mouse_action(Some(Fg::Shell), 0, true), MouseAction::Drop);
-        assert_eq!(mouse_action(Some(Fg::Shell), 32, true), MouseAction::Drop);
-        assert_eq!(mouse_action(Some(Fg::Shell), 0, false), MouseAction::Drop);
+        // a shell holds the grab too, so the plugin selector runs; middle/right
+        // stay dropped so SGR never hits a prompt. unknown fails safe.
+        assert_eq!(mouse_action(Some(Fg::Shell), 0, true), MouseAction::Select);
+        assert_eq!(mouse_action(Some(Fg::Shell), 32, true), MouseAction::Select);
+        assert_eq!(mouse_action(Some(Fg::Shell), 0, false), MouseAction::Select);
         assert_eq!(mouse_action(Some(Fg::Shell), 1, true), MouseAction::Drop);
+        assert_eq!(mouse_action(Some(Fg::Shell), 2, true), MouseAction::Drop);
         assert_eq!(mouse_action(None, 0, true), MouseAction::Drop);
     }
 
@@ -2132,11 +2153,11 @@ mod tests {
 
     // Exercise the real input routing: a release and the next press can share
     // one stdin read. A local sink stands in for the session; no SSH is used.
-    async fn selection_followed_by_press(next_drag: bool) {
+    fn test_app() -> App {
         let args = parse_args(&["unused".into(), "p1".into()]).unwrap();
         let tty = true;
         let (tx, _rx) = mpsc::channel(256);
-        let mut app = App {
+        App {
             args,
             tty,
             grid: Grid::new(),
@@ -2169,7 +2190,11 @@ mod tests {
             mouse_flush_at: None,
             paste_queue: Vec::new(),
             paste_original: None,
-        };
+        }
+    }
+
+    async fn selection_followed_by_press(next_drag: bool) {
+        let mut app = test_app();
         let mut child = tokio::process::Command::new("cat")
             .stdin(Stdio::piped()).stdout(Stdio::null()).kill_on_drop(true)
             .spawn().unwrap();
@@ -2207,6 +2232,77 @@ mod tests {
     #[tokio::test]
     async fn copying_selection_preserves_next_drag_in_same_read() {
         selection_followed_by_press(true).await;
+    }
+
+    // Drag-to-copy at a mirrored shell, through the real input routing: the
+    // drag is selected locally and copied via OSC 52, and neither the drag nor
+    // a plain click ever reaches the remote prompt as mouse bytes.
+    #[tokio::test]
+    async fn plain_drag_at_a_shell_copies_and_clicks_are_never_forwarded() {
+        use tokio::io::AsyncReadExt as _;
+        CLIPBOARD.with(|c| c.borrow_mut().clear());
+        let mut app = test_app();
+        let mut child = tokio::process::Command::new("cat")
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).kill_on_drop(true)
+            .spawn().unwrap();
+        let mut echoed = child.stdout.take().unwrap();
+        app.session = Some(Session {
+            gen: 1, mode: Mode::Control, pid: child.id().unwrap() as i32,
+            stdin: child.stdin.take().unwrap(),
+        });
+        app.mode = Mode::Control;
+        app.remote_fg = Some(Fg::Shell);
+        // Keep foreground polling local to this fixture: suppress SSH probes.
+        app.fg_poll_at = Some(Instant::now());
+        app.grid.resize(80, 24);
+        app.grid.apply("$ echo hello");
+
+        // plain (unmodified) left drag across "echo", then release
+        app.handle_stdin(b"\x1b[<0;3;1M\x1b[<32;5;1M\x1b[<32;6;1M\x1b[<0;6;1m".to_vec())
+            .await;
+        // a plain click that never moved
+        app.handle_stdin(b"\x1b[<0;9;1M\x1b[<0;9;1m".to_vec()).await;
+        drop(app); // closes the session's stdin so `cat` hits EOF
+        let mut sent = String::new();
+        echoed.read_to_string(&mut sent).await.unwrap();
+        let _ = child.wait().await;
+
+        use base64::Engine as _;
+        let want = format!(
+            "\x1b]52;c;{}\x07",
+            base64::engine::general_purpose::STANDARD.encode("echo")
+        );
+        assert_eq!(CLIPBOARD.with(|c| c.borrow().clone()), vec![want]);
+        // nothing at all was sent to the remote: no terminal.input carrying the
+        // drag or the click's replayed SGR bytes
+        assert!(!sent.contains("terminal.input"), "forwarded to the prompt: {sent}");
+    }
+
+    // The same gesture in a TUI still replays a click to the app.
+    #[tokio::test]
+    async fn plain_click_in_a_tui_is_still_replayed() {
+        use tokio::io::AsyncReadExt as _;
+        let mut app = test_app();
+        let mut child = tokio::process::Command::new("cat")
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).kill_on_drop(true)
+            .spawn().unwrap();
+        let mut echoed = child.stdout.take().unwrap();
+        app.session = Some(Session {
+            gen: 1, mode: Mode::Control, pid: child.id().unwrap() as i32,
+            stdin: child.stdin.take().unwrap(),
+        });
+        app.mode = Mode::Control;
+        app.remote_fg = Some(Fg::Mouse);
+        app.fg_poll_at = Some(Instant::now());
+        app.grid.resize(80, 24);
+        app.handle_stdin(b"\x1b[<0;9;1M\x1b[<0;9;1m".to_vec()).await;
+        drop(app);
+        let mut sent = String::new();
+        echoed.read_to_string(&mut sent).await.unwrap();
+        let _ = child.wait().await;
+        use base64::Engine as _;
+        let click = base64::engine::general_purpose::STANDARD.encode(b"\x1b[<0;9;1M\x1b[<0;9;1m");
+        assert!(sent.contains("terminal.input") && sent.contains(&click), "{sent}");
     }
 
 }

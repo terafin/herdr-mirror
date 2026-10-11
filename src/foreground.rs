@@ -39,8 +39,9 @@ pub fn is_shell(name: &str) -> bool {
 /// not read mouse reports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Fg {
-    /// interactive shell at a prompt: sets no mouse modes, so the grab is
-    /// released and herdr does its own native selection
+    /// interactive shell at a prompt: sets no mouse modes. The grab stays held
+    /// so the wheel can scroll, but clicks/drags are dropped rather than
+    /// forwarded or selected; Shift+drag is herdr's native-selection escape
     Shell,
     /// an agent CLI. herdr identified it, so this is not a guess.
     Agent,

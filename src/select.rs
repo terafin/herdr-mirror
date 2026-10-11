@@ -32,8 +32,9 @@
 // the mouse" to keep, which is the whole reason this shape was chosen: such a
 // list is unbounded, drifts, and fails silently when it is wrong.
 //
-// A shell foreground is still handled the old way (the grab is released and
-// herdr selects natively), so none of this applies at a prompt.
+// A shell foreground never reaches this: the grab is held there too (so the
+// wheel can scroll), but `mouse_action` drops the left button at a prompt, and
+// Shift+drag remains herdr's native-selection escape.
 
 use std::fmt::Write as _;
 

@@ -554,8 +554,9 @@ fn button_number(btn: u32) -> u32 {
 /// and codex both discard the bytes cleanly, so withholding it only stood to
 /// swallow clicks the day one of them grows mouse support.
 ///
-/// A shell is unaffected: the grab is released there, so herdr does its own
-/// native selection and none of this arrives.
+/// A shell is unaffected: the grab is held there (so the wheel scrolls), but the
+/// left button is dropped like every other click, so raw SGR never reaches the
+/// prompt; Shift+drag is herdr's native-selection escape.
 ///
 /// The cost is an in-app *drag*: vim's mouse visual-select, a resize handle.
 fn mouse_action(fg: Option<Fg>, btn: u32, press: bool) -> MouseAction {
@@ -1297,16 +1298,16 @@ impl App {
             return;
         }
         // refresh the foreground classification on any input while active.
-        // keyboard reaches us even when the grab is released at a shell, so this
-        // is what catches a shell→TUI switch — a released grab means mouse events
-        // stop arriving here, so mouse alone can never trigger the re-poll.
+        // the grab is always held, so mouse events trigger this as well as the
+        // keyboard — either one catches a shell→TUI switch.
         self.spawn_foreground_poll(false);
         // and re-check shortly after input settles, to catch a change the input
         // just caused (e.g. `:q` quitting vim — the poll above still sees vim)
         self.settle_at = Some(Instant::now() + SETTLE_DELAY);
         // wheel becomes a semantic scroll (server decides app vs scrollback);
-        // clicks/drags forward to the remote pty only when the foreground is a
-        // TUI — at a shell they're dropped so they don't garbage the prompt
+        // left-button drags go to the local selection and other clicks forward
+        // to the remote pty, only when the foreground is a TUI/agent — at a
+        // shell they're dropped so they don't garbage the prompt
         let mut rest: Vec<u8> = Vec::with_capacity(buf.len());
         let mut i = 0usize;
         let mut scrolls: Vec<serde_json::Value> = Vec::new();
@@ -1749,8 +1750,14 @@ mod tests {
             assert_eq!(mouse_action(Some(fg), 1, true), MouseAction::ForwardRaw);
             assert_eq!(mouse_action(Some(fg), 2, true), MouseAction::ForwardRaw);
         }
-        // a shell releases the grab, so these never arrive; unknown fails safe
+        // fleet: the grab is held at a shell, so these DO arrive, and every
+        // left-button phase is dropped (no local selection, no raw SGR into the
+        // prompt). Upstream ab72e41 selects here instead; the fleet keeps
+        // Shift+drag native selection. Unknown fails safe.
         assert_eq!(mouse_action(Some(Fg::Shell), 0, true), MouseAction::Drop);
+        assert_eq!(mouse_action(Some(Fg::Shell), 32, true), MouseAction::Drop);
+        assert_eq!(mouse_action(Some(Fg::Shell), 0, false), MouseAction::Drop);
+        assert_eq!(mouse_action(Some(Fg::Shell), 1, true), MouseAction::Drop);
         assert_eq!(mouse_action(None, 0, true), MouseAction::Drop);
     }
 
